@@ -1,0 +1,310 @@
+use crate::protocol::NetworkMessage;
+use crate::types::Message;
+use anyhow::{Context, Result};
+use libp2p::{
+    core::upgrade,
+    dns, gossipsub, identify, mdns, noise,
+    futures::StreamExt,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, Multiaddr, PeerId, Swarm, Transport,
+};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
+
+pub mod peer;
+
+/// Network events sent to the application
+#[derive(Debug, Clone)]
+pub enum NetworkEvent {
+    /// A new peer has connected
+    PeerConnected(PeerId),
+
+    /// A peer has disconnected
+    PeerDisconnected(PeerId),
+
+    /// Received a chat message from a peer
+    MessageReceived(Message),
+
+    /// Local listening address established
+    ListeningOn(Multiaddr),
+}
+
+/// Commands sent to the network layer
+#[derive(Debug, Clone)]
+pub enum NetworkCommand {
+    /// Broadcast a message to all peers
+    BroadcastMessage(Message),
+
+    /// Connect to a specific peer address
+    ConnectToPeer(Multiaddr),
+
+    /// Get list of connected peers
+    ListPeers,
+}
+
+/// Network behavior combining multiple protocols
+#[derive(NetworkBehaviour)]
+pub struct BurrowBehaviour {
+    pub gossipsub: gossipsub::Behaviour,
+    pub mdns: mdns::tokio::Behaviour,
+    pub identify: identify::Behaviour,
+}
+
+/// Network manager handling P2P communication
+pub struct Network {
+    swarm: Swarm<BurrowBehaviour>,
+    event_tx: mpsc::UnboundedSender<NetworkEvent>,
+    command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
+    gossip_topic: gossipsub::IdentTopic,
+}
+
+impl Network {
+    /// Create a new network instance
+    pub async fn new(
+        event_tx: mpsc::UnboundedSender<NetworkEvent>,
+        command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
+    ) -> Result<Self> {
+        // Generate a keypair for this peer
+        let local_key = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer_id = PeerId::from(local_key.public());
+        info!("Local peer ID: {}", local_peer_id);
+
+        // Set up TCP transport with noise encryption and yamux multiplexing
+        let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
+
+        let transport = dns::tokio::Transport::system(tcp_transport)?
+            .upgrade(upgrade::Version::V1)
+            .authenticate(noise::Config::new(&local_key)?)
+            .multiplex(yamux::Config::default())
+            .boxed();
+
+        // Configure gossipsub for message broadcasting
+        let message_id_fn = |message: &gossipsub::Message| {
+            let mut s = DefaultHasher::new();
+            message.data.hash(&mut s);
+            gossipsub::MessageId::from(s.finish().to_string())
+        };
+
+        let gossipsub_config = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(1))
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .message_id_fn(message_id_fn)
+            .build()
+            .expect("Valid gossipsub config");
+
+        let mut gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(local_key.clone()),
+            gossipsub_config,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to create gossipsub: {}", e))?;
+
+        // Create the gossipsub topic for chat messages
+        let gossip_topic = gossipsub::IdentTopic::new("burrow-chat");
+        gossipsub.subscribe(&gossip_topic)?;
+
+        // Set up mDNS for local peer discovery
+        let mdns = mdns::tokio::Behaviour::new(
+            mdns::Config::default(),
+            local_peer_id,
+        )?;
+
+        // Set up identify protocol
+        let identify = identify::Behaviour::new(identify::Config::new(
+            "/burrow/0.1.0".to_string(),
+            local_key.public(),
+        ));
+
+        // Combine behaviors
+        let behaviour = BurrowBehaviour {
+            gossipsub,
+            mdns,
+            identify,
+        };
+
+        // Create the swarm
+        let swarm = Swarm::new(
+            transport,
+            behaviour,
+            local_peer_id,
+            libp2p::swarm::Config::with_tokio_executor()
+                .with_idle_connection_timeout(Duration::from_secs(60)),
+        );
+
+        Ok(Self {
+            swarm,
+            event_tx,
+            command_rx,
+            gossip_topic,
+        })
+    }
+
+    /// Start listening on a TCP port
+    pub fn listen(&mut self, port: u16) -> Result<()> {
+        let listen_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", port)
+            .parse()
+            .context("Invalid listen address")?;
+
+        self.swarm
+            .listen_on(listen_addr)
+            .context("Failed to start listening")?;
+
+        Ok(())
+    }
+
+    /// Run the network event loop
+    pub async fn run(mut self) -> Result<()> {
+        info!("Starting network event loop");
+
+        loop {
+            tokio::select! {
+                // Handle swarm events
+                event = self.swarm.select_next_some() => {
+                    if let Err(e) = self.handle_swarm_event(event).await {
+                        error!("Error handling swarm event: {}", e);
+                    }
+                }
+
+                // Handle commands from application
+                Some(command) = self.command_rx.recv() => {
+                    if let Err(e) = self.handle_command(command).await {
+                        error!("Error handling command: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Handle swarm events
+    async fn handle_swarm_event(&mut self, event: SwarmEvent<<BurrowBehaviour as NetworkBehaviour>::ToSwarm>) -> Result<()> {
+        match event {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                info!("Listening on {}", address);
+                self.event_tx.send(NetworkEvent::ListeningOn(address))?;
+            }
+
+            SwarmEvent::Behaviour(BurrowBehaviourEvent::Gossipsub(
+                gossipsub::Event::Message {
+                    propagation_source: peer_id,
+                    message,
+                    ..
+                },
+            )) => {
+                debug!("Received message from {}", peer_id);
+                if let Ok(network_msg) = NetworkMessage::from_bytes(&message.data) {
+                    match network_msg {
+                        NetworkMessage::ChatMessage(msg) => {
+                            debug!("Chat message: {:?}", msg);
+                            self.event_tx.send(NetworkEvent::MessageReceived(msg))?;
+                        }
+                        _ => {
+                            debug!("Received other network message type");
+                        }
+                    }
+                }
+            }
+
+            SwarmEvent::Behaviour(BurrowBehaviourEvent::Mdns(mdns::Event::Discovered(
+                peers,
+            ))) => {
+                for (peer_id, addr) in peers {
+                    info!("Discovered peer via mDNS: {} at {}", peer_id, addr);
+                    if let Err(e) = self.swarm.dial(addr.clone()) {
+                        warn!("Failed to dial discovered peer {}: {}", peer_id, e);
+                    }
+                }
+            }
+
+            SwarmEvent::Behaviour(BurrowBehaviourEvent::Mdns(mdns::Event::Expired(
+                peers,
+            ))) => {
+                for (peer_id, _) in peers {
+                    debug!("mDNS peer expired: {}", peer_id);
+                }
+            }
+
+            SwarmEvent::Behaviour(BurrowBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. },
+            )) => {
+                debug!(
+                    "Identified peer {}: protocol={} agent={}",
+                    peer_id, info.protocol_version, info.agent_version
+                );
+            }
+
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                info!("Connection established with {} via {}", peer_id, endpoint.get_remote_address());
+                self.event_tx.send(NetworkEvent::PeerConnected(peer_id))?;
+            }
+
+            SwarmEvent::ConnectionClosed {
+                peer_id, cause, ..
+            } => {
+                info!("Connection closed with {}: {:?}", peer_id, cause);
+                self.event_tx.send(NetworkEvent::PeerDisconnected(peer_id))?;
+            }
+
+            SwarmEvent::IncomingConnection { .. } => {
+                debug!("Incoming connection");
+            }
+
+            SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                warn!("Outgoing connection error to {:?}: {}", peer_id, error);
+            }
+
+            SwarmEvent::IncomingConnectionError { error, .. } => {
+                warn!("Incoming connection error: {}", error);
+            }
+
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Handle commands from the application
+    async fn handle_command(&mut self, command: NetworkCommand) -> Result<()> {
+        match command {
+            NetworkCommand::BroadcastMessage(message) => {
+                debug!("Broadcasting message: {:?}", message.id);
+                let network_msg = NetworkMessage::ChatMessage(message);
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
+            }
+
+            NetworkCommand::ConnectToPeer(addr) => {
+                info!("Attempting to connect to peer at {}", addr);
+                if let Err(e) = self.swarm.dial(addr.clone()) {
+                    warn!("Failed to dial {}: {}", addr, e);
+                }
+            }
+
+            NetworkCommand::ListPeers => {
+                let peers: Vec<_> = self.swarm.connected_peers().collect();
+                info!("Connected peers: {:?}", peers);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Create network channels for communication
+pub fn create_network_channels() -> (
+    mpsc::UnboundedSender<NetworkEvent>,
+    mpsc::UnboundedReceiver<NetworkEvent>,
+    mpsc::UnboundedSender<NetworkCommand>,
+    mpsc::UnboundedReceiver<NetworkCommand>,
+) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    (event_tx, event_rx, command_tx, command_rx)
+}
