@@ -30,6 +30,7 @@ enum AppMode {
 pub struct App {
     storage: Storage,
     peer_id: PeerId,
+    libp2p_peer_id: libp2p::PeerId,
     channels: Vec<Channel>,
     selected_channel: Option<usize>,
     messages: Vec<Message>,
@@ -50,6 +51,7 @@ impl App {
     pub async fn new(
         storage: Storage,
         peer_id: PeerId,
+        libp2p_peer_id: libp2p::PeerId,
         network_event_rx: mpsc::UnboundedReceiver<NetworkEvent>,
         network_command_tx: mpsc::UnboundedSender<NetworkCommand>,
     ) -> Result<Self> {
@@ -86,6 +88,7 @@ impl App {
         Ok(Self {
             storage,
             peer_id,
+            libp2p_peer_id,
             channels,
             selected_channel,
             messages,
@@ -432,10 +435,17 @@ impl App {
     }
 
     fn ui(&mut self, f: &mut Frame) {
+        // Main layout: content area + status bar at bottom
+        let main_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(1)])
+            .split(f.area());
+
+        // Content area with horizontal split
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
-            .split(f.area());
+            .split(main_chunks[0]);
 
         // Left panel: channel list
         self.render_channel_list(f, chunks[0]);
@@ -448,6 +458,9 @@ impl App {
 
         self.render_messages(f, right_chunks[0]);
         self.render_input(f, right_chunks[1]);
+
+        // Status bar at bottom
+        self.render_status_bar(f, main_chunks[1]);
 
         // Render modals on top
         match self.mode {
@@ -550,6 +563,43 @@ impl App {
             .style(Style::default().fg(Color::White));
 
         f.render_widget(paragraph, area);
+    }
+
+    fn render_status_bar(&self, f: &mut Frame, area: Rect) {
+        // Shorten peer ID for display (first 8 chars)
+        let peer_id_str = self.libp2p_peer_id.to_string();
+        let peer_id_short = if peer_id_str.len() > 12 {
+            format!("{}...{}", &peer_id_str[..6], &peer_id_str[peer_id_str.len()-6..])
+        } else {
+            peer_id_str
+        };
+
+        // Get first listen address or show count
+        let listen_info = if self.listen_addrs.is_empty() {
+            "Starting...".to_string()
+        } else if self.listen_addrs.len() == 1 {
+            self.listen_addrs[0].clone()
+        } else {
+            format!("{} addresses", self.listen_addrs.len())
+        };
+
+        // Connected peers count
+        let peer_count = self.peer_manager.peer_count();
+        let peers_text = if peer_count == 1 {
+            "1 peer".to_string()
+        } else {
+            format!("{} peers", peer_count)
+        };
+
+        let status_text = format!(
+            " ID: {} | Listening: {} | Connected: {} ",
+            peer_id_short, listen_info, peers_text
+        );
+
+        let status = Paragraph::new(status_text)
+            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+
+        f.render_widget(status, area);
     }
 
     fn render_new_channel_modal(&self, f: &mut Frame, area: Rect) {

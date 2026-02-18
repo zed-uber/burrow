@@ -64,11 +64,12 @@ pub struct Network {
 impl Network {
     /// Create a new network instance
     pub async fn new(
+        keypair: libp2p::identity::Keypair,
         event_tx: mpsc::UnboundedSender<NetworkEvent>,
         command_rx: mpsc::UnboundedReceiver<NetworkCommand>,
     ) -> Result<Self> {
-        // Generate a keypair for this peer
-        let local_key = libp2p::identity::Keypair::generate_ed25519();
+        // Use provided keypair for persistent identity
+        let local_key = keypair;
         let local_peer_id = PeerId::from(local_key.public());
         info!("Local peer ID: {}", local_peer_id);
 

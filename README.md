@@ -67,10 +67,17 @@ cargo run --release
 
 ### Data Storage
 
-Messages are stored in a SQLite database at:
+**Messages** are stored in a SQLite database at:
 - **Linux**: `~/.local/share/burrow/burrow.db`
 - **macOS**: `~/Library/Application Support/burrow/burrow.db`
 - **Windows**: `%LOCALAPPDATA%\burrow\burrow.db`
+
+**Identity** (cryptographic keypair) is stored at:
+- **Linux**: `~/.local/share/burrow/identity.key`
+- **macOS**: `~/Library/Application Support/burrow/identity.key`
+- **Windows**: `%LOCALAPPDATA%\burrow\identity.key`
+
+Your identity file contains your Ed25519 keypair and is created on first run. This gives you a persistent peer ID across restarts. **Keep this file secure** - it's your cryptographic identity on the network.
 
 ### Logs
 
@@ -99,11 +106,12 @@ tail -f ~/.local/share/burrow/burrow.log
 
 **Networking Features:**
 - ✅ P2P networking with libp2p (TCP + Noise + Yamux)
+- ✅ Persistent cryptographic identity (Ed25519 keypair)
 - ✅ Automatic peer discovery via mDNS on local network
 - ✅ Manual peer connection via multiaddr (Ctrl+P)
 - ✅ Real-time message broadcasting to connected peers
 - ✅ Receive and store messages from other peers
-- ✅ Peer connection status display in TUI
+- ✅ Status bar showing peer ID, listen addresses, and connected peers
 - ✅ Gossipsub for efficient message distribution
 - ✅ Logs written to file (not stdout) to avoid TUI interference
 
@@ -209,11 +217,17 @@ src/
 ├── storage/
 │   ├── mod.rs       # Storage implementation
 │   └── schema.sql   # Database schema
+├── identity/
+│   └── mod.rs       # Persistent cryptographic identity (Phase 2)
+├── network/         # P2P networking (Phase 2)
+│   ├── mod.rs       # Network implementation
+│   └── peer.rs      # Peer management
+├── protocol/
+│   └── mod.rs       # Network protocol messages (Phase 2)
 └── tui/
     └── mod.rs       # Terminal UI
 
-Future modules (Phases 2-7):
-├── network/         # P2P networking (Phase 2)
+Future modules (Phases 3-7):
 ├── crdt/           # CRDT implementations (Phase 3)
 ├── gossip/         # Gossip protocol (Phase 4)
 ├── crypto/         # Encryption (Phase 5)

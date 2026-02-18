@@ -3,13 +3,31 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 use uuid::Uuid;
 
-/// Peer identifier (Ed25519 public key will be used later)
+/// Peer identifier derived from libp2p PeerId (public key hash)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct PeerId(pub Uuid);
 
 impl PeerId {
+    /// Create a new random peer ID (for testing only)
     pub fn new() -> Self {
         Self(Uuid::now_v7())
+    }
+
+    /// Create a peer ID from a libp2p PeerId by hashing it deterministically
+    pub fn from_libp2p(peer_id: &libp2p::PeerId) -> Self {
+        // Convert libp2p PeerId to bytes and hash to get a deterministic UUID
+        let peer_bytes = peer_id.to_bytes();
+
+        // Use the first 16 bytes of the peer_id as UUID bytes
+        // If less than 16 bytes, pad with hash of remaining bytes
+        let mut uuid_bytes = [0u8; 16];
+        if peer_bytes.len() >= 16 {
+            uuid_bytes.copy_from_slice(&peer_bytes[..16]);
+        } else {
+            uuid_bytes[..peer_bytes.len()].copy_from_slice(&peer_bytes);
+        }
+
+        Self(Uuid::from_bytes(uuid_bytes))
     }
 }
 

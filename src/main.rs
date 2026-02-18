@@ -1,3 +1,4 @@
+mod identity;
 mod network;
 mod protocol;
 mod storage;
@@ -5,6 +6,7 @@ mod tui;
 mod types;
 
 use anyhow::Result;
+use identity::Identity;
 use network::Network;
 use storage::Storage;
 use tracing_subscriber::EnvFilter;
@@ -37,16 +39,20 @@ async fn main() -> Result<()> {
 
     let storage = Storage::new(&db_path).await?;
 
-    // Generate or load peer ID (for Phase 1, just generate a new one)
-    // In later phases, this will be loaded from config
-    let peer_id = PeerId::new();
-    tracing::info!("Peer ID: {}", peer_id.0);
+    // Load or generate persistent identity
+    let identity_path = data_dir.join("identity.key");
+    let identity = Identity::load_or_generate(&identity_path)?;
+    let libp2p_peer_id = identity.peer_id();
+    let peer_id = PeerId::from_libp2p(&libp2p_peer_id);
+
+    tracing::info!("Peer ID: {}", libp2p_peer_id);
+    tracing::info!("App Peer UUID: {}", peer_id.0);
 
     // Create network channels
     let (event_tx, event_rx, command_tx, command_rx) = network::create_network_channels();
 
-    // Create and configure network
-    let mut network = Network::new(event_tx, command_rx).await?;
+    // Create and configure network with persistent keypair
+    let mut network = Network::new(identity.keypair().clone(), event_tx, command_rx).await?;
 
     // Start listening on a port (default: 9000)
     let listen_port = std::env::var("BURROW_PORT")
@@ -65,7 +71,7 @@ async fn main() -> Result<()> {
     });
 
     // Run TUI with network channels
-    let mut app = tui::App::new(storage, peer_id, event_rx, command_tx).await?;
+    let mut app = tui::App::new(storage, peer_id, libp2p_peer_id, event_rx, command_tx).await?;
     let tui_result = app.run().await;
 
     // Cleanup
