@@ -2,14 +2,23 @@
 
 A decentralized, encrypted peer-to-peer chat application with a terminal user interface (TUI).
 
-## Current Status: Phase 1 Complete ✓
+## Current Status: Phase 2 Complete ✓
 
-**Phase 1: Foundation & Storage** has been implemented with:
+**Phase 1: Foundation & Storage** ✅
 - ✅ Core type definitions (PeerId, MessageId, ChannelId, Message, Channel)
 - ✅ Vector Clock implementation for causal ordering
 - ✅ SQLite storage layer with CRUD operations
 - ✅ Basic TUI with channel management and messaging
 - ✅ Local message persistence
+
+**Phase 2: P2P Networking** ✅
+- ✅ libp2p integration with TCP, Noise encryption, and Yamux multiplexing
+- ✅ Gossipsub for message broadcasting between peers
+- ✅ mDNS for automatic local peer discovery
+- ✅ Manual peer connection via multiaddr (Ctrl+P)
+- ✅ Message broadcast and reception
+- ✅ Peer lifecycle management (connect/disconnect events)
+- ✅ Network events integrated into TUI
 
 ## Quick Start
 
@@ -49,6 +58,7 @@ cargo run --release
 **All Keyboard Shortcuts:**
 - `Ctrl+H` - Show help menu
 - `Ctrl+N` - Open new channel dialog
+- `Ctrl+P` - Connect to peer (opens dialog with multiaddr input)
 - `↑/↓` - Navigate channels
 - `Enter` - Send message (or confirm in dialogs)
 - `Esc` - Cancel dialog
@@ -62,8 +72,21 @@ Messages are stored in a SQLite database at:
 - **macOS**: `~/Library/Application Support/burrow/burrow.db`
 - **Windows**: `%LOCALAPPDATA%\burrow\burrow.db`
 
-### What's Working in Phase 1
+### Logs
 
+Application logs are written to a file (to avoid interfering with the TUI):
+- **Linux**: `~/.local/share/burrow/burrow.log`
+- **macOS**: `~/Library/Application Support/burrow/burrow.log`
+- **Windows**: `%LOCALAPPDATA%\burrow\burrow.log`
+
+You can tail the log file in another terminal to see what's happening:
+```bash
+tail -f ~/.local/share/burrow/burrow.log
+```
+
+### What's Working (Phases 1-2)
+
+**Local Features:**
 - ✅ Auto-created "me" channel on first run
 - ✅ Modal dialog for creating new channels (Ctrl+N)
 - ✅ Keyboard-driven channel navigation (↑/↓)
@@ -73,6 +96,16 @@ Messages are stored in a SQLite database at:
 - ✅ Messages ordered chronologically
 - ✅ Help menu (Ctrl+H) with all shortcuts
 - ✅ Clean, responsive TUI interface
+
+**Networking Features:**
+- ✅ P2P networking with libp2p (TCP + Noise + Yamux)
+- ✅ Automatic peer discovery via mDNS on local network
+- ✅ Manual peer connection via multiaddr (Ctrl+P)
+- ✅ Real-time message broadcasting to connected peers
+- ✅ Receive and store messages from other peers
+- ✅ Peer connection status display in TUI
+- ✅ Gossipsub for efficient message distribution
+- ✅ Logs written to file (not stdout) to avoid TUI interference
 
 ## Architecture
 
@@ -154,8 +187,16 @@ cargo test
 
 ### Running with Debug Logging
 
+To enable debug logging, set the `RUST_LOG` environment variable:
+
 ```bash
 RUST_LOG=burrow=debug cargo run
+```
+
+Then in another terminal, tail the log file to see debug output:
+
+```bash
+tail -f ~/.local/share/burrow/burrow.log
 ```
 
 ### Project Structure

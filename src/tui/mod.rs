@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
 use std::io;
@@ -553,6 +553,9 @@ impl App {
     }
 
     fn render_new_channel_modal(&self, f: &mut Frame, area: Rect) {
+        // Clear the entire screen to remove underlying UI
+        f.render_widget(Clear, area);
+
         let text = vec![
             Line::from(""),
             Line::from(vec![Span::styled(
@@ -610,18 +613,13 @@ impl App {
             ])
             .split(vertical_chunks[1]);
 
-        // Clear the background
-        f.render_widget(
-            Block::default()
-                .style(Style::default().bg(Color::Black))
-                .borders(Borders::NONE),
-            horizontal_chunks[1],
-        );
-
         f.render_widget(paragraph, horizontal_chunks[1]);
     }
 
     fn render_connect_peer_modal(&self, f: &mut Frame, area: Rect) {
+        // Clear the entire screen to remove underlying UI
+        f.render_widget(Clear, area);
+
         // Show listening addresses
         let listen_addrs_text = if !self.listen_addrs.is_empty() {
             format!("Listening on: {}", self.listen_addrs.join(", "))
@@ -696,18 +694,13 @@ impl App {
             ])
             .split(vertical_chunks[1]);
 
-        // Clear the background
-        f.render_widget(
-            Block::default()
-                .style(Style::default().bg(Color::Black))
-                .borders(Borders::NONE),
-            horizontal_chunks[1],
-        );
-
         f.render_widget(paragraph, horizontal_chunks[1]);
     }
 
     fn render_help(&self, f: &mut Frame, area: Rect) {
+        // Clear the entire screen to remove underlying UI
+        f.render_widget(Clear, area);
+
         let help_text = vec![
             Line::from(vec![Span::styled(
                 "Burrow - Keyboard Shortcuts",

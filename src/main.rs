@@ -12,23 +12,26 @@ use types::PeerId;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
+    // Initialize storage directory
+    let data_dir = dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("burrow");
+
+    // Create directory if it doesn't exist
+    std::fs::create_dir_all(&data_dir)?;
+
+    // Initialize logging to file (not stdout, to avoid interfering with TUI)
+    let log_file = std::fs::File::create(data_dir.join("burrow.log"))?;
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("burrow=info".parse()?))
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false) // Disable ANSI colors in log file
         .init();
 
     tracing::info!("Starting Burrow...");
 
     // Initialize storage
-    let db_path = dirs::data_local_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("burrow")
-        .join("burrow.db");
-
-    // Create directory if it doesn't exist
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let db_path = data_dir.join("burrow.db");
 
     tracing::info!("Database path: {:?}", db_path);
 
