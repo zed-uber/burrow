@@ -30,6 +30,17 @@ pub enum NetworkEvent {
 
     /// Local listening address established
     ListeningOn(Multiaddr),
+
+    /// Connection attempt to a peer failed
+    ConnectionFailed {
+        address: String,
+        error: String,
+    },
+
+    /// Successfully initiated connection to a peer
+    ConnectionDialing {
+        address: String,
+    },
 }
 
 /// Commands sent to the network layer
@@ -255,6 +266,11 @@ impl Network {
 
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 warn!("Outgoing connection error to {:?}: {}", peer_id, error);
+                let address = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
+                self.event_tx.send(NetworkEvent::ConnectionFailed {
+                    address,
+                    error: error.to_string(),
+                })?;
             }
 
             SwarmEvent::IncomingConnectionError { error, .. } => {
@@ -283,8 +299,20 @@ impl Network {
 
             NetworkCommand::ConnectToPeer(addr) => {
                 info!("Attempting to connect to peer at {}", addr);
-                if let Err(e) = self.swarm.dial(addr.clone()) {
-                    warn!("Failed to dial {}: {}", addr, e);
+                match self.swarm.dial(addr.clone()) {
+                    Ok(_) => {
+                        info!("Dialing {}", addr);
+                        self.event_tx.send(NetworkEvent::ConnectionDialing {
+                            address: addr.to_string(),
+                        })?;
+                    }
+                    Err(e) => {
+                        warn!("Failed to dial {}: {}", addr, e);
+                        self.event_tx.send(NetworkEvent::ConnectionFailed {
+                            address: addr.to_string(),
+                            error: e.to_string(),
+                        })?;
+                    }
                 }
             }
 

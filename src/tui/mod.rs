@@ -18,13 +18,41 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 enum AppMode {
     Normal,
     Help,
     NewChannel,
     ConnectPeer,
+}
+
+#[derive(Clone)]
+struct Notification {
+    message: String,
+    level: NotificationLevel,
+    timestamp: Instant,
+}
+
+#[derive(Clone)]
+enum NotificationLevel {
+    Info,
+    Success,
+    Error,
+}
+
+impl Notification {
+    fn new(message: String, level: NotificationLevel) -> Self {
+        Self {
+            message,
+            level,
+            timestamp: Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.timestamp.elapsed() > Duration::from_secs(5)
+    }
 }
 
 pub struct App {
@@ -45,6 +73,7 @@ pub struct App {
     network_command_tx: mpsc::UnboundedSender<NetworkCommand>,
     peer_manager: PeerManager,
     listen_addrs: Vec<String>,
+    notification: Option<Notification>,
 }
 
 impl App {
@@ -103,6 +132,7 @@ impl App {
             network_command_tx,
             peer_manager: PeerManager::new(),
             listen_addrs: Vec::new(),
+            notification: None,
         })
     }
 
@@ -134,6 +164,13 @@ impl App {
         <B as ratatui::backend::Backend>::Error: Send + Sync + std::error::Error + 'static,
     {
         loop {
+            // Clear expired notifications
+            if let Some(ref notif) = self.notification {
+                if notif.is_expired() {
+                    self.notification = None;
+                }
+            }
+
             terminal.draw(|f| self.ui(f))?;
 
             tokio::select! {
@@ -184,6 +221,16 @@ impl App {
             NetworkEvent::PeerConnected(peer_id) => {
                 tracing::info!("Peer connected: {}", peer_id);
                 self.peer_manager.add_peer(peer_id, None);
+                let peer_str = peer_id.to_string();
+                let peer_short = if peer_str.len() > 12 {
+                    format!("{}...{}", &peer_str[..6], &peer_str[peer_str.len()-6..])
+                } else {
+                    peer_str
+                };
+                self.notification = Some(Notification::new(
+                    format!("Connected to peer {}", peer_short),
+                    NotificationLevel::Success,
+                ));
             }
             NetworkEvent::PeerDisconnected(peer_id) => {
                 tracing::info!("Peer disconnected: {}", peer_id);
@@ -214,6 +261,20 @@ impl App {
             NetworkEvent::ListeningOn(addr) => {
                 tracing::info!("Listening on: {}", addr);
                 self.listen_addrs.push(addr.to_string());
+            }
+            NetworkEvent::ConnectionDialing { address } => {
+                tracing::info!("Dialing peer at {}", address);
+                self.notification = Some(Notification::new(
+                    format!("Connecting to {}...", address),
+                    NotificationLevel::Info,
+                ));
+            }
+            NetworkEvent::ConnectionFailed { address, error } => {
+                tracing::warn!("Connection failed to {}: {}", address, error);
+                self.notification = Some(Notification::new(
+                    format!("Connection failed to {}: {}", address, error),
+                    NotificationLevel::Error,
+                ));
             }
         }
 
@@ -475,6 +536,11 @@ impl App {
             }
             AppMode::Normal => {}
         }
+
+        // Render notification on top of everything
+        if let Some(ref notif) = self.notification {
+            self.render_notification(f, f.area(), notif);
+        }
     }
 
     fn render_channel_list(&mut self, f: &mut Frame, area: Rect) {
@@ -600,6 +666,43 @@ impl App {
             .style(Style::default().bg(Color::DarkGray).fg(Color::White));
 
         f.render_widget(status, area);
+    }
+
+    fn render_notification(&self, f: &mut Frame, area: Rect, notification: &Notification) {
+        // Position notification at the top center
+        let notification_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(0)])
+            .split(area)[0];
+
+        let horizontal_layout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(20),
+                Constraint::Percentage(60),
+                Constraint::Percentage(20),
+            ])
+            .split(notification_area);
+
+        let notif_area = horizontal_layout[1];
+
+        // Choose color based on level
+        let (border_color, text_color) = match notification.level {
+            NotificationLevel::Info => (Color::Cyan, Color::White),
+            NotificationLevel::Success => (Color::Green, Color::White),
+            NotificationLevel::Error => (Color::Red, Color::White),
+        };
+
+        let notification_widget = Paragraph::new(notification.message.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color))
+            )
+            .style(Style::default().fg(text_color).bg(Color::Black))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(notification_widget, notif_area);
     }
 
     fn render_new_channel_modal(&self, f: &mut Frame, area: Rect) {
