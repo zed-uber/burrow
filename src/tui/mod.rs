@@ -238,22 +238,54 @@ impl App {
             }
             NetworkEvent::MessageReceived(message) => {
                 tracing::info!("Message received: {:?}", message.id);
-                // Store the message
-                self.storage.store_message(&message).await?;
 
-                // Update vector clock
-                self.vector_clock.merge(&message.vector_clock);
+                // Check if channel exists, create it if not
+                let channel_exists = self.channels.iter().any(|c| c.id == message.channel_id);
+                if !channel_exists {
+                    tracing::info!("Creating placeholder channel for {}", message.channel_id.0);
+                    // Create a placeholder channel with a temporary name
+                    // In Phase 3, we'll properly sync channel metadata via CRDTs
+                    let channel_id_short = message.channel_id.0.to_string();
+                    let channel_name = format!("channel-{}", &channel_id_short[..8]);
+                    let channel = Channel {
+                        id: message.channel_id,
+                        name: channel_name.clone(),
+                        created_at: std::time::SystemTime::now(),
+                    };
 
-                // Update lamport clock
-                if message.lamport_timestamp >= self.lamport_clock {
-                    self.lamport_clock = message.lamport_timestamp + 1;
+                    if let Err(e) = self.storage.store_channel(&channel).await {
+                        tracing::error!("Failed to create placeholder channel: {}", e);
+                    } else {
+                        self.channels = self.storage.get_all_channels().await?;
+                        self.notification = Some(Notification::new(
+                            format!("New channel discovered: {}", channel_name),
+                            NotificationLevel::Info,
+                        ));
+                    }
                 }
 
-                // If it's for the currently selected channel, add it to the view
-                if let Some(idx) = self.selected_channel {
-                    if let Some(channel) = self.channels.get(idx) {
-                        if message.channel_id == channel.id {
-                            self.messages.push(message);
+                // Store the message
+                if let Err(e) = self.storage.store_message(&message).await {
+                    tracing::error!("Failed to store message: {}", e);
+                    self.notification = Some(Notification::new(
+                        format!("Failed to store message: {}", e),
+                        NotificationLevel::Error,
+                    ));
+                } else {
+                    // Update vector clock
+                    self.vector_clock.merge(&message.vector_clock);
+
+                    // Update lamport clock
+                    if message.lamport_timestamp >= self.lamport_clock {
+                        self.lamport_clock = message.lamport_timestamp + 1;
+                    }
+
+                    // If it's for the currently selected channel, add it to the view
+                    if let Some(idx) = self.selected_channel {
+                        if let Some(channel) = self.channels.get(idx) {
+                            if message.channel_id == channel.id {
+                                self.messages.push(message);
+                            }
                         }
                     }
                 }
