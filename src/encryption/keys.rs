@@ -11,7 +11,7 @@ use std::time::SystemTime;
 pub fn generate_registration_id() -> u32 {
     let mut rng = OsRng.unwrap_err();
     // Signal uses 14-bit registration IDs
-    rng.gen_range(1..16384)
+    rng.random_range(1..16384)
 }
 
 /// Generate a new identity key pair

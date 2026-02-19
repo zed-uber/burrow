@@ -10,46 +10,96 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
-/// SQLite-backed Signal Protocol storage
-///
-/// Implements all required Signal Protocol storage traits:
-/// - IdentityKeyStore: Identity keys and trust
-/// - PreKeyStore: Pre-keys for X3DH
-/// - SignedPreKeyStore: Signed pre-keys
-/// - SessionStore: Double Ratchet sessions
-/// - SenderKeyStore: Sender keys for groups
-/// - KyberPreKeyStore: Kyber pre-keys (in-memory for now)
+// Individual store implementations that share the SQLite pool
+
 #[derive(Clone)]
-pub struct SignalStore {
+pub struct SqliteSessionStore {
+    pool: Arc<SqlitePool>,
+}
+
+#[derive(Clone)]
+pub struct SqlitePreKeyStore {
+    pool: Arc<SqlitePool>,
+}
+
+#[derive(Clone)]
+pub struct SqliteSignedPreKeyStore {
+    pool: Arc<SqlitePool>,
+}
+
+#[derive(Clone)]
+pub struct SqliteIdentityKeyStore {
     pool: Arc<SqlitePool>,
     identity_key_pair: Arc<IdentityKeyPair>,
     registration_id: u32,
-    // In-memory store for kyber pre-keys (TODO: persist to database)
+}
+
+#[derive(Clone)]
+pub struct SqliteSenderKeyStore {
+    pool: Arc<SqlitePool>,
+}
+
+#[derive(Clone)]
+pub struct InMemoryKyberPreKeyStore {
     kyber_pre_keys: Arc<TokioMutex<HashMap<u32, KyberPreKeyRecord>>>,
+}
+
+/// SQLite-backed Signal Protocol storage
+///
+/// Each store is independently lockable to allow concurrent access
+/// This is necessary because libsignal functions require multiple store types simultaneously
+#[derive(Clone)]
+pub struct SignalStore {
+    pub session_store: Arc<TokioMutex<SqliteSessionStore>>,
+    pub pre_key_store: Arc<TokioMutex<SqlitePreKeyStore>>,
+    pub signed_pre_key_store: Arc<TokioMutex<SqliteSignedPreKeyStore>>,
+    pub identity_store: Arc<TokioMutex<SqliteIdentityKeyStore>>,
+    pub sender_key_store: Arc<TokioMutex<SqliteSenderKeyStore>>,
+    pub kyber_pre_key_store: Arc<TokioMutex<InMemoryKyberPreKeyStore>>,
 }
 
 impl SignalStore {
     pub fn new(pool: SqlitePool, identity_key_pair: IdentityKeyPair, registration_id: u32) -> Self {
+        let pool = Arc::new(pool);
+
         Self {
-            pool: Arc::new(pool),
-            identity_key_pair: Arc::new(identity_key_pair),
-            registration_id,
-            kyber_pre_keys: Arc::new(TokioMutex::new(HashMap::new())),
+            session_store: Arc::new(TokioMutex::new(SqliteSessionStore {
+                pool: pool.clone(),
+            })),
+            pre_key_store: Arc::new(TokioMutex::new(SqlitePreKeyStore {
+                pool: pool.clone(),
+            })),
+            signed_pre_key_store: Arc::new(TokioMutex::new(SqliteSignedPreKeyStore {
+                pool: pool.clone(),
+            })),
+            identity_store: Arc::new(TokioMutex::new(SqliteIdentityKeyStore {
+                pool: pool.clone(),
+                identity_key_pair: Arc::new(identity_key_pair.clone()),
+                registration_id,
+            })),
+            sender_key_store: Arc::new(TokioMutex::new(SqliteSenderKeyStore {
+                pool: pool.clone(),
+            })),
+            kyber_pre_key_store: Arc::new(TokioMutex::new(InMemoryKyberPreKeyStore {
+                kyber_pre_keys: Arc::new(TokioMutex::new(HashMap::new())),
+            })),
         }
     }
 
-    pub fn identity_key_pair(&self) -> &IdentityKeyPair {
-        &self.identity_key_pair
+    pub async fn identity_key_pair(&self) -> IdentityKeyPair {
+        let store = self.identity_store.lock().await;
+        (*store.identity_key_pair).clone()
     }
 
-    pub fn registration_id(&self) -> u32 {
-        self.registration_id
+    pub async fn registration_id(&self) -> u32 {
+        let store = self.identity_store.lock().await;
+        store.registration_id
     }
 }
 
-// Implement IdentityKeyStore
+// Implement IdentityKeyStore for SqliteIdentityKeyStore
 #[async_trait::async_trait(?Send)]
-impl IdentityKeyStore for SignalStore {
+impl IdentityKeyStore for SqliteIdentityKeyStore {
     async fn get_identity_key_pair(&self) -> Result<IdentityKeyPair, libsignal_protocol::SignalProtocolError> {
         Ok((*self.identity_key_pair).clone())
     }
@@ -61,17 +111,16 @@ impl IdentityKeyStore for SignalStore {
     async fn save_identity(
         &mut self,
         address: &ProtocolAddress,
-        identity_key: &IdentityKey,
+        identity: &IdentityKey,
     ) -> Result<IdentityChange, libsignal_protocol::SignalProtocolError> {
         let address_str = address.name();
-        let identity_bytes = identity_key.serialize();
+        let identity_bytes = identity.serialize();
 
-        // Check if identity already exists
+        // Check if we already have an identity for this address
         let existing = self.get_identity(address).await?;
 
-        sqlx::query(
-            "INSERT INTO identity_keys (address, identity_key, trust_level)
-             VALUES (?, ?, 1)
+        let result = sqlx::query(
+            "INSERT INTO identity_keys (address, identity_key, trust_level) VALUES (?, ?, 0)
              ON CONFLICT(address) DO UPDATE SET identity_key = excluded.identity_key"
         )
         .bind(address_str)
@@ -83,25 +132,21 @@ impl IdentityKeyStore for SignalStore {
             format!("Database error: {}", e)
         ))?;
 
-        match existing {
-            Some(existing_key) if existing_key.public_key() != identity_key.public_key() => {
-                // Identity changed - replaced existing
-                Ok(IdentityChange::ReplacedExisting)
-            }
-            _ => {
-                // New identity or unchanged
-                Ok(IdentityChange::NewOrUnchanged)
-            }
+        if existing.is_some() && existing.as_ref() != Some(identity) {
+            Ok(IdentityChange::ReplacedExisting)
+        } else {
+            Ok(IdentityChange::NewOrUnchanged)
         }
     }
 
     async fn is_trusted_identity(
         &self,
         address: &ProtocolAddress,
-        identity_key: &IdentityKey,
+        identity: &IdentityKey,
         _direction: Direction,
     ) -> Result<bool, libsignal_protocol::SignalProtocolError> {
         let address_str = address.name();
+        let identity_bytes = identity.serialize();
 
         let row = sqlx::query(
             "SELECT identity_key FROM identity_keys WHERE address = ?"
@@ -117,15 +162,9 @@ impl IdentityKeyStore for SignalStore {
         match row {
             Some(row) => {
                 let stored_bytes: Vec<u8> = row.get("identity_key");
-                let stored_key = IdentityKey::decode(&stored_bytes)
-                    .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-                        "is_trusted_identity",
-                        format!("Failed to decode identity key: {}", e)
-                    ))?;
-
-                Ok(stored_key.public_key() == identity_key.public_key())
+                Ok(&stored_bytes[..] == &identity_bytes[..])
             }
-            None => Ok(true), // First contact, trust on first use (TOFU)
+            None => Ok(true), // Trust on first use
         }
     }
 
@@ -149,61 +188,42 @@ impl IdentityKeyStore for SignalStore {
         match row {
             Some(row) => {
                 let identity_bytes: Vec<u8> = row.get("identity_key");
-                let identity_key = IdentityKey::decode(&identity_bytes)
-                    .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-                        "get_identity",
-                        format!("Failed to decode identity key: {}", e)
-                    ))?;
-                Ok(Some(identity_key))
+                let identity = IdentityKey::decode(&identity_bytes)?;
+                Ok(Some(identity))
             }
             None => Ok(None),
         }
     }
 }
 
-// Implement PreKeyStore
+// Implement PreKeyStore for SqlitePreKeyStore
 #[async_trait::async_trait(?Send)]
-impl PreKeyStore for SignalStore {
-    async fn get_pre_key(
-        &self,
-        pre_key_id: PreKeyId,
-    ) -> Result<PreKeyRecord, libsignal_protocol::SignalProtocolError> {
-        let id_value: u32 = pre_key_id.into();
+impl PreKeyStore for SqlitePreKeyStore {
+    async fn get_pre_key(&self, prekey_id: PreKeyId) -> Result<PreKeyRecord, libsignal_protocol::SignalProtocolError> {
+        let id_value: u32 = prekey_id.into();
+
         let row = sqlx::query(
             "SELECT record FROM pre_keys WHERE pre_key_id = ?"
         )
         .bind(id_value as i64)
-        .fetch_optional(&*self.pool)
+        .fetch_one(&*self.pool)
         .await
-        .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-            "get_pre_key",
-            format!("Database error: {}", e)
-        ))?;
+        .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidPreKeyId)?;
 
-        match row {
-            Some(row) => {
-                let record_bytes: Vec<u8> = row.get("record");
-                PreKeyRecord::deserialize(&record_bytes)
-            }
-            None => Err(libsignal_protocol::SignalProtocolError::InvalidPreKeyId),
-        }
+        let record_bytes: Vec<u8> = row.get("record");
+        PreKeyRecord::deserialize(&record_bytes)
     }
 
     async fn save_pre_key(
         &mut self,
-        pre_key_id: PreKeyId,
+        prekey_id: PreKeyId,
         record: &PreKeyRecord,
     ) -> Result<(), libsignal_protocol::SignalProtocolError> {
-        let id_value: u32 = pre_key_id.into();
-        let record_bytes = record.serialize()
-            .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-                "save_pre_key",
-                format!("Failed to serialize: {}", e)
-            ))?;
+        let id_value: u32 = prekey_id.into();
+        let record_bytes = record.serialize()?;
 
         sqlx::query(
-            "INSERT INTO pre_keys (pre_key_id, record) VALUES (?, ?)
-             ON CONFLICT(pre_key_id) DO UPDATE SET record = excluded.record"
+            "INSERT OR REPLACE INTO pre_keys (pre_key_id, record) VALUES (?, ?)"
         )
         .bind(id_value as i64)
         .bind(&record_bytes[..])
@@ -217,74 +237,54 @@ impl PreKeyStore for SignalStore {
         Ok(())
     }
 
-    async fn remove_pre_key(
-        &mut self,
-        pre_key_id: PreKeyId,
-    ) -> Result<(), libsignal_protocol::SignalProtocolError> {
-        let id_value: u32 = pre_key_id.into();
-        sqlx::query(
-            "DELETE FROM pre_keys WHERE pre_key_id = ?"
-        )
-        .bind(id_value as i64)
-        .execute(&*self.pool)
-        .await
-        .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-            "remove_pre_key",
-            format!("Database error: {}", e)
-        ))?;
+    async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<(), libsignal_protocol::SignalProtocolError> {
+        let id_value: u32 = prekey_id.into();
+
+        sqlx::query("DELETE FROM pre_keys WHERE pre_key_id = ?")
+            .bind(id_value as i64)
+            .execute(&*self.pool)
+            .await
+            .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
+                "remove_pre_key",
+                format!("Database error: {}", e)
+            ))?;
 
         Ok(())
     }
 }
 
-// Implement SignedPreKeyStore
+// Implement SignedPreKeyStore for SqliteSignedPreKeyStore
 #[async_trait::async_trait(?Send)]
-impl SignedPreKeyStore for SignalStore {
+impl SignedPreKeyStore for SqliteSignedPreKeyStore {
     async fn get_signed_pre_key(
         &self,
-        signed_pre_key_id: SignedPreKeyId,
+        signed_prekey_id: SignedPreKeyId,
     ) -> Result<SignedPreKeyRecord, libsignal_protocol::SignalProtocolError> {
-        let id_value: u32 = signed_pre_key_id.into();
+        let id_value: u32 = signed_prekey_id.into();
+
         let row = sqlx::query(
             "SELECT record FROM signed_pre_keys WHERE signed_pre_key_id = ?"
         )
         .bind(id_value as i64)
-        .fetch_optional(&*self.pool)
+        .fetch_one(&*self.pool)
         .await
-        .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-            "get_signed_pre_key",
-            format!("Database error: {}", e)
-        ))?;
+        .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidSignedPreKeyId)?;
 
-        match row {
-            Some(row) => {
-                let record_bytes: Vec<u8> = row.get("record");
-                SignedPreKeyRecord::deserialize(&record_bytes)
-            }
-            None => Err(libsignal_protocol::SignalProtocolError::InvalidSignedPreKeyId),
-        }
+        let record_bytes: Vec<u8> = row.get("record");
+        SignedPreKeyRecord::deserialize(&record_bytes)
     }
 
     async fn save_signed_pre_key(
         &mut self,
-        signed_pre_key_id: SignedPreKeyId,
+        signed_prekey_id: SignedPreKeyId,
         record: &SignedPreKeyRecord,
     ) -> Result<(), libsignal_protocol::SignalProtocolError> {
-        let id_value: u32 = signed_pre_key_id.into();
-        let record_bytes = record.serialize()
-            .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-                "save_signed_pre_key",
-                format!("Failed to serialize: {}", e)
-            ))?;
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let id_value: u32 = signed_prekey_id.into();
+        let record_bytes = record.serialize()?;
+        let timestamp = record.timestamp()?.epoch_millis() as i64;
 
         sqlx::query(
-            "INSERT INTO signed_pre_keys (signed_pre_key_id, record, timestamp) VALUES (?, ?, ?)
-             ON CONFLICT(signed_pre_key_id) DO UPDATE SET record = excluded.record, timestamp = excluded.timestamp"
+            "INSERT OR REPLACE INTO signed_pre_keys (signed_pre_key_id, record, timestamp) VALUES (?, ?, ?)"
         )
         .bind(id_value as i64)
         .bind(&record_bytes[..])
@@ -300,9 +300,9 @@ impl SignedPreKeyStore for SignalStore {
     }
 }
 
-// Implement SessionStore
+// Implement SessionStore for SqliteSessionStore
 #[async_trait::async_trait(?Send)]
-impl SessionStore for SignalStore {
+impl SessionStore for SqliteSessionStore {
     async fn load_session(
         &self,
         address: &ProtocolAddress,
@@ -325,8 +325,8 @@ impl SessionStore for SignalStore {
         match row {
             Some(row) => {
                 let record_bytes: Vec<u8> = row.get("record");
-                let session = SessionRecord::deserialize(&record_bytes)?;
-                Ok(Some(session))
+                let record = SessionRecord::deserialize(&record_bytes)?;
+                Ok(Some(record))
             }
             None => Ok(None),
         }
@@ -339,15 +339,10 @@ impl SessionStore for SignalStore {
     ) -> Result<(), libsignal_protocol::SignalProtocolError> {
         let address_str = address.name();
         let device_id: u32 = address.device_id().into();
-        let record_bytes = record.serialize()
-            .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-                "store_session",
-                format!("Failed to serialize: {}", e)
-            ))?;
+        let record_bytes = record.serialize()?;
 
         sqlx::query(
-            "INSERT INTO sessions (address, device_id, record) VALUES (?, ?, ?)
-             ON CONFLICT(address, device_id) DO UPDATE SET record = excluded.record"
+            "INSERT OR REPLACE INTO sessions (address, device_id, record) VALUES (?, ?, ?)"
         )
         .bind(address_str)
         .bind(device_id as i64)
@@ -363,9 +358,9 @@ impl SessionStore for SignalStore {
     }
 }
 
-// Implement SenderKeyStore
+// Implement SenderKeyStore for SqliteSenderKeyStore
 #[async_trait::async_trait(?Send)]
-impl SenderKeyStore for SignalStore {
+impl SenderKeyStore for SqliteSenderKeyStore {
     async fn store_sender_key(
         &mut self,
         sender: &ProtocolAddress,
@@ -374,15 +369,10 @@ impl SenderKeyStore for SignalStore {
     ) -> Result<(), libsignal_protocol::SignalProtocolError> {
         let sender_str = sender.name();
         let distribution_bytes = distribution_id.as_bytes();
-        let record_bytes = record.serialize()
-            .map_err(|e| libsignal_protocol::SignalProtocolError::InvalidState(
-                "store_sender_key",
-                format!("Failed to serialize: {}", e)
-            ))?;
+        let record_bytes = record.serialize()?;
 
         sqlx::query(
-            "INSERT INTO sender_keys (address, distribution_id, record) VALUES (?, ?, ?)
-             ON CONFLICT(address, distribution_id) DO UPDATE SET record = excluded.record"
+            "INSERT OR REPLACE INTO sender_keys (address, distribution_id, record) VALUES (?, ?, ?)"
         )
         .bind(sender_str)
         .bind(&distribution_bytes[..])
@@ -428,9 +418,9 @@ impl SenderKeyStore for SignalStore {
     }
 }
 
-// Implement KyberPreKeyStore (in-memory for now)
+// Implement KyberPreKeyStore for InMemoryKyberPreKeyStore
 #[async_trait::async_trait(?Send)]
-impl KyberPreKeyStore for SignalStore {
+impl KyberPreKeyStore for InMemoryKyberPreKeyStore {
     async fn get_kyber_pre_key(
         &self,
         kyber_prekey_id: KyberPreKeyId,
@@ -457,7 +447,7 @@ impl KyberPreKeyStore for SignalStore {
 
     async fn mark_kyber_pre_key_used(
         &mut self,
-        kyber_prekey_id: KyberPreKeyId,
+        _kyber_prekey_id: KyberPreKeyId,
         _ec_prekey_id: SignedPreKeyId,
         _base_key: &PublicKey,
     ) -> Result<(), libsignal_protocol::SignalProtocolError> {
@@ -467,5 +457,6 @@ impl KyberPreKeyStore for SignalStore {
     }
 }
 
-// Implement ProtocolStore (marker trait)
-impl ProtocolStore for SignalStore {}
+// Note: We don't implement ProtocolStore on SignalStore itself
+// Instead, we use the individual fields which each implement their respective traits
+// This allows independent borrowing when calling libsignal functions
