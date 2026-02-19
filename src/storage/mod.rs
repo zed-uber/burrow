@@ -39,6 +39,55 @@ impl Storage {
             .await
             .context("Failed to initialize schema")?;
 
+        // Run migrations for existing databases
+        self.migrate_schema().await?;
+
+        Ok(())
+    }
+
+    /// Migrate existing database schema to latest version
+    async fn migrate_schema(&self) -> Result<()> {
+        // Check if channels table has the new columns
+        let table_info: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('channels') WHERE name IN ('channel_type', 'members')"
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        // If we don't have 2 results, we need to migrate
+        if table_info.len() < 2 {
+            tracing::info!("Migrating database schema to add channel_type and members columns");
+
+            // Add channel_type column if missing
+            if !table_info.iter().any(|(name,)| name == "channel_type") {
+                sqlx::query("ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'Group'")
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to add channel_type column")?;
+            }
+
+            // Add members column if missing
+            if !table_info.iter().any(|(name,)| name == "members") {
+                // Default to empty members list (empty bincode vec)
+                let empty_members: Vec<PeerId> = Vec::new();
+                let empty_members_bytes = bincode::serialize(&empty_members)?;
+
+                sqlx::query("ALTER TABLE channels ADD COLUMN members BLOB NOT NULL DEFAULT X''")
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to add members column")?;
+
+                // Update all existing channels with empty members list
+                sqlx::query("UPDATE channels SET members = ?")
+                    .bind(&empty_members_bytes)
+                    .execute(&self.pool)
+                    .await
+                    .context("Failed to set default members")?;
+            }
+
+            tracing::info!("Database migration completed");
+        }
+
         Ok(())
     }
 
