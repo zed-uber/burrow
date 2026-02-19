@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use libsignal_protocol::{
     Direction, GenericSignedPreKey, IdentityChange, IdentityKey, IdentityKeyPair,
-    IdentityKeyStore, PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, SenderKeyRecord,
-    SenderKeyStore, SessionRecord, SessionStore, SignedPreKeyId, SignedPreKeyRecord,
-    SignedPreKeyStore,
+    IdentityKeyStore, KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord,
+    PreKeyStore, ProtocolAddress, ProtocolStore, PublicKey, SenderKeyRecord, SenderKeyStore,
+    SessionRecord, SessionStore, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
 };
 use sqlx::{Row, SqlitePool};
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::Mutex as TokioMutex;
 
 /// SQLite-backed Signal Protocol storage
 ///
@@ -16,11 +18,14 @@ use std::sync::Arc;
 /// - SignedPreKeyStore: Signed pre-keys
 /// - SessionStore: Double Ratchet sessions
 /// - SenderKeyStore: Sender keys for groups
+/// - KyberPreKeyStore: Kyber pre-keys (in-memory for now)
 #[derive(Clone)]
 pub struct SignalStore {
     pool: Arc<SqlitePool>,
     identity_key_pair: Arc<IdentityKeyPair>,
     registration_id: u32,
+    // In-memory store for kyber pre-keys (TODO: persist to database)
+    kyber_pre_keys: Arc<TokioMutex<HashMap<u32, KyberPreKeyRecord>>>,
 }
 
 impl SignalStore {
@@ -29,6 +34,7 @@ impl SignalStore {
             pool: Arc::new(pool),
             identity_key_pair: Arc::new(identity_key_pair),
             registration_id,
+            kyber_pre_keys: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -421,3 +427,45 @@ impl SenderKeyStore for SignalStore {
         }
     }
 }
+
+// Implement KyberPreKeyStore (in-memory for now)
+#[async_trait::async_trait(?Send)]
+impl KyberPreKeyStore for SignalStore {
+    async fn get_kyber_pre_key(
+        &self,
+        kyber_prekey_id: KyberPreKeyId,
+    ) -> Result<KyberPreKeyRecord, libsignal_protocol::SignalProtocolError> {
+        let id_value: u32 = kyber_prekey_id.into();
+        let store = self.kyber_pre_keys.lock().await;
+
+        store
+            .get(&id_value)
+            .cloned()
+            .ok_or(libsignal_protocol::SignalProtocolError::InvalidKyberPreKeyId)
+    }
+
+    async fn save_kyber_pre_key(
+        &mut self,
+        kyber_prekey_id: KyberPreKeyId,
+        record: &KyberPreKeyRecord,
+    ) -> Result<(), libsignal_protocol::SignalProtocolError> {
+        let id_value: u32 = kyber_prekey_id.into();
+        let mut store = self.kyber_pre_keys.lock().await;
+        store.insert(id_value, record.clone());
+        Ok(())
+    }
+
+    async fn mark_kyber_pre_key_used(
+        &mut self,
+        kyber_prekey_id: KyberPreKeyId,
+        _ec_prekey_id: SignedPreKeyId,
+        _base_key: &PublicKey,
+    ) -> Result<(), libsignal_protocol::SignalProtocolError> {
+        // For in-memory store, we just keep the key
+        // In a production implementation, you'd mark it as used in the database
+        Ok(())
+    }
+}
+
+// Implement ProtocolStore (marker trait)
+impl ProtocolStore for SignalStore {}
