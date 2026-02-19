@@ -122,6 +122,73 @@ impl Storage {
         .await
         .context("Failed to create peers table")?;
 
+        // Phase 5: Create encryption tables
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS identity_keys (
+                address TEXT PRIMARY KEY NOT NULL,
+                identity_key BLOB NOT NULL,
+                trust_level INTEGER NOT NULL DEFAULT 0
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create identity_keys table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pre_keys (
+                pre_key_id INTEGER PRIMARY KEY NOT NULL,
+                record BLOB NOT NULL
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create pre_keys table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS signed_pre_keys (
+                signed_pre_key_id INTEGER PRIMARY KEY NOT NULL,
+                record BLOB NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create signed_pre_keys table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS sessions (
+                address TEXT NOT NULL,
+                device_id INTEGER NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (address, device_id)
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create sessions table")?;
+
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS sender_keys (
+                address TEXT NOT NULL,
+                distribution_id BLOB NOT NULL,
+                record BLOB NOT NULL,
+                PRIMARY KEY (address, distribution_id)
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create sender_keys table")?;
+
         // Release connection before running migrations
         drop(conn);
 
