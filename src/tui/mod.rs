@@ -91,7 +91,7 @@ impl App {
 
         // Create default "self" channel if no channels exist
         if channels.is_empty() {
-            let self_channel = Channel::new("me".to_string());
+            let self_channel = Channel::new("me".to_string(), peer_id);
             storage.store_channel(&self_channel).await?;
             channels = storage.get_all_channels().await?;
         }
@@ -247,11 +247,7 @@ impl App {
                     // In Phase 3, we'll properly sync channel metadata via CRDTs
                     let channel_id_short = message.channel_id.0.to_string();
                     let channel_name = format!("channel-{}", &channel_id_short[..8]);
-                    let channel = Channel {
-                        id: message.channel_id,
-                        name: channel_name.clone(),
-                        created_at: std::time::SystemTime::now(),
-                    };
+                    let channel = Channel::placeholder(message.channel_id, channel_name.clone());
 
                     if let Err(e) = self.storage.store_channel(&channel).await {
                         tracing::error!("Failed to create placeholder channel: {}", e);
@@ -422,7 +418,7 @@ impl App {
     }
 
     async fn create_channel_from_modal(&mut self) -> Result<()> {
-        let channel = Channel::new(self.new_channel_input.clone());
+        let channel = Channel::new(self.new_channel_input.clone(), self.peer_id);
         let channel_id = channel.id;
         self.storage.store_channel(&channel).await?;
         self.channels = self.storage.get_all_channels().await?;
@@ -580,8 +576,23 @@ impl App {
             .channels
             .iter()
             .map(|channel| {
+                use crate::types::ChannelType;
+
+                // Choose icon based on channel type
+                let icon = match channel.channel_type {
+                    ChannelType::PeerToPeer => "@",
+                    ChannelType::Group => "#",
+                };
+
+                // Show member count for groups
+                let member_info = if channel.channel_type == ChannelType::Group && !channel.members.is_empty() {
+                    format!(" ({})", channel.members.len())
+                } else {
+                    String::new()
+                };
+
                 let content = Line::from(vec![Span::styled(
-                    format!("# {}", channel.name),
+                    format!("{} {}{}", icon, channel.name, member_info),
                     Style::default().fg(Color::White),
                 )]);
                 ListItem::new(content)
@@ -613,11 +624,24 @@ impl App {
     }
 
     fn render_messages(&self, f: &mut Frame, area: Rect) {
-        let channel_name = self
+        use crate::types::ChannelType;
+
+        let channel_title = self
             .selected_channel
             .and_then(|idx| self.channels.get(idx))
-            .map(|c| c.name.as_str())
-            .unwrap_or("No channel selected");
+            .map(|c| {
+                let icon = match c.channel_type {
+                    ChannelType::PeerToPeer => "@",
+                    ChannelType::Group => "#",
+                };
+                let member_info = if c.channel_type == ChannelType::Group && !c.members.is_empty() {
+                    format!(" ({} members)", c.members.len())
+                } else {
+                    String::new()
+                };
+                format!("{} {}{}", icon, c.name, member_info)
+            })
+            .unwrap_or_else(|| "No channel selected".to_string());
 
         let messages: Vec<Line> = self
             .messages
@@ -639,7 +663,7 @@ impl App {
         let paragraph = Paragraph::new(messages)
             .block(
                 Block::default()
-                    .title(format!(" {} ", channel_name))
+                    .title(format!(" {} ", channel_title))
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Cyan)),
             )

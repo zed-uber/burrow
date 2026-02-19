@@ -223,8 +223,9 @@ impl Network {
             ))) => {
                 for (peer_id, addr) in peers {
                     info!("Discovered peer via mDNS: {} at {}", peer_id, addr);
+                    // Auto-dial discovered peers silently (no notification for auto-discovery)
                     if let Err(e) = self.swarm.dial(addr.clone()) {
-                        warn!("Failed to dial discovered peer {}: {}", peer_id, e);
+                        debug!("Failed to auto-dial discovered peer {}: {}", peer_id, e);
                     }
                 }
             }
@@ -265,12 +266,9 @@ impl Network {
             }
 
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                warn!("Outgoing connection error to {:?}: {}", peer_id, error);
-                let address = peer_id.map(|p| p.to_string()).unwrap_or_else(|| "unknown".to_string());
-                self.event_tx.send(NetworkEvent::ConnectionFailed {
-                    address,
-                    error: error.to_string(),
-                })?;
+                // Log but don't send notification - this is often from auto-discovery
+                // Manual dial failures are caught immediately in handle_command
+                debug!("Outgoing connection error to {:?}: {}", peer_id, error);
             }
 
             SwarmEvent::IncomingConnectionError { error, .. } => {

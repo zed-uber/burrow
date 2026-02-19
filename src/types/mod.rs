@@ -179,21 +179,59 @@ impl Message {
     }
 }
 
+/// Channel type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelType {
+    /// Direct message with one other peer
+    PeerToPeer,
+    /// Group channel with multiple peers
+    Group,
+}
+
 /// Channel metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
     pub name: String,
+    pub channel_type: ChannelType,
+    pub members: Vec<PeerId>,  // List of peer IDs in this channel
     pub created_at: SystemTime,
-    // CRDT members will be added in Phase 3
+    // CRDT state will be added in Phase 3 for conflict-free replication
     // Encryption keys will be added in Phase 5
 }
 
 impl Channel {
-    pub fn new(name: String) -> Self {
+    /// Create a new group channel with the creator as the first member
+    pub fn new(name: String, creator: PeerId) -> Self {
         Self {
             id: ChannelId::new(),
             name,
+            channel_type: ChannelType::Group,
+            members: vec![creator],
+            created_at: SystemTime::now(),
+        }
+    }
+
+    /// Create a new peer-to-peer channel between two peers
+    pub fn new_peer_to_peer(peer1: PeerId, peer2: PeerId) -> Self {
+        // Name is the other peer's ID (will show nicely formatted in UI)
+        let name = format!("@{}", peer2.0.simple());
+        Self {
+            id: ChannelId::new(),
+            name,
+            channel_type: ChannelType::PeerToPeer,
+            members: vec![peer1, peer2],
+            created_at: SystemTime::now(),
+        }
+    }
+
+    /// Create a placeholder channel (for received messages from unknown channels)
+    pub fn placeholder(id: ChannelId, name: String) -> Self {
+        Self {
+            id,
+            name,
+            channel_type: ChannelType::Group,
+            members: Vec::new(),  // Unknown members
             created_at: SystemTime::now(),
         }
     }

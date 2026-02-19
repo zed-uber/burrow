@@ -1,4 +1,4 @@
-use crate::types::{Channel, ChannelId, Message, MessageId, PeerId, VectorClock};
+use crate::types::{Channel, ChannelId, ChannelType, Message, MessageId, PeerId, VectorClock};
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -159,6 +159,11 @@ impl Storage {
     /// Store a channel
     pub async fn store_channel(&self, channel: &Channel) -> Result<()> {
         let id_bytes = channel.id.0.as_bytes();
+        let channel_type_str = match channel.channel_type {
+            ChannelType::PeerToPeer => "PeerToPeer",
+            ChannelType::Group => "Group",
+        };
+        let members_bytes = bincode::serialize(&channel.members)?;
         let created_at = channel
             .created_at
             .duration_since(UNIX_EPOCH)
@@ -167,14 +172,18 @@ impl Storage {
 
         sqlx::query(
             r#"
-            INSERT INTO channels (id, name, created_at)
-            VALUES (?, ?, ?)
+            INSERT INTO channels (id, name, channel_type, members, created_at)
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name
+                name = excluded.name,
+                channel_type = excluded.channel_type,
+                members = excluded.members
             "#,
         )
         .bind(&id_bytes[..])
         .bind(&channel.name)
+        .bind(channel_type_str)
+        .bind(members_bytes)
         .bind(created_at)
         .execute(&self.pool)
         .await
@@ -189,7 +198,7 @@ impl Storage {
 
         let row = sqlx::query(
             r#"
-            SELECT id, name, created_at
+            SELECT id, name, channel_type, members, created_at
             FROM channels
             WHERE id = ?
             "#,
@@ -202,14 +211,24 @@ impl Storage {
             Some(row) => {
                 let id_bytes: Vec<u8> = row.get("id");
                 let name: String = row.get("name");
+                let channel_type_str: String = row.get("channel_type");
+                let members_bytes: Vec<u8> = row.get("members");
                 let created_at: i64 = row.get("created_at");
 
                 let id = ChannelId(uuid::Uuid::from_slice(&id_bytes)?);
+                let channel_type = match channel_type_str.as_str() {
+                    "PeerToPeer" => ChannelType::PeerToPeer,
+                    "Group" => ChannelType::Group,
+                    _ => ChannelType::Group, // Default to group for unknown types
+                };
+                let members: Vec<PeerId> = bincode::deserialize(&members_bytes)?;
                 let created_at = UNIX_EPOCH + std::time::Duration::from_secs(created_at as u64);
 
                 Ok(Some(Channel {
                     id,
                     name,
+                    channel_type,
+                    members,
                     created_at,
                 }))
             }
@@ -221,7 +240,7 @@ impl Storage {
     pub async fn get_all_channels(&self) -> Result<Vec<Channel>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, created_at
+            SELECT id, name, channel_type, members, created_at
             FROM channels
             ORDER BY created_at DESC
             "#,
@@ -233,14 +252,24 @@ impl Storage {
         for row in rows {
             let id_bytes: Vec<u8> = row.get("id");
             let name: String = row.get("name");
+            let channel_type_str: String = row.get("channel_type");
+            let members_bytes: Vec<u8> = row.get("members");
             let created_at: i64 = row.get("created_at");
 
             let id = ChannelId(uuid::Uuid::from_slice(&id_bytes)?);
+            let channel_type = match channel_type_str.as_str() {
+                "PeerToPeer" => ChannelType::PeerToPeer,
+                "Group" => ChannelType::Group,
+                _ => ChannelType::Group,
+            };
+            let members: Vec<PeerId> = bincode::deserialize(&members_bytes)?;
             let created_at = UNIX_EPOCH + std::time::Duration::from_secs(created_at as u64);
 
             channels.push(Channel {
                 id,
                 name,
+                channel_type,
+                members,
                 created_at,
             });
         }
@@ -277,7 +306,8 @@ mod tests {
     async fn test_channel_crud() {
         let storage = Storage::new(":memory:").await.unwrap();
 
-        let channel = Channel::new("test-channel".to_string());
+        let peer_id = PeerId::new();
+        let channel = Channel::new("test-channel".to_string(), peer_id);
         storage.store_channel(&channel).await.unwrap();
 
         let retrieved = storage.get_channel(channel.id).await.unwrap().unwrap();
@@ -292,10 +322,9 @@ mod tests {
     async fn test_message_crud() {
         let storage = Storage::new(":memory:").await.unwrap();
 
-        let channel = Channel::new("test-channel".to_string());
-        storage.store_channel(&channel).await.unwrap();
-
         let peer_id = PeerId::new();
+        let channel = Channel::new("test-channel".to_string(), peer_id);
+        storage.store_channel(&channel).await.unwrap();
         let mut vector_clock = VectorClock::new();
         vector_clock.increment(peer_id);
 
