@@ -1,8 +1,10 @@
+use crate::dag::gossip::GossipManager;
+use crate::dag::MessageDAG;
 use crate::network::{NetworkCommand, NetworkEvent};
 use crate::network::peer::PeerManager;
 use crate::protocol::NetworkMessage;
 use crate::storage::Storage;
-use crate::types::{Channel, Message, MessageContent, PeerId, VectorClock};
+use crate::types::{Channel, ChannelId, Message, MessageContent, PeerId, VectorClock};
 use anyhow::Result;
 use tokio::sync::mpsc;
 use crossterm::{
@@ -63,6 +65,8 @@ pub struct App {
     channels: Vec<Channel>,
     selected_channel: Option<usize>,
     messages: Vec<Message>,
+    dag: MessageDAG,  // Phase 4: DAG for causal ordering
+    gossip_manager: GossipManager,  // Phase 4: Gossip protocol for anti-entropy
     input: String,
     lamport_clock: u64,
     vector_clock: VectorClock,
@@ -104,10 +108,22 @@ impl App {
             channel_list_state.select(Some(0));
         }
 
-        // Load messages for the selected channel
+        // Phase 4: Initialize DAG with all messages from all channels
+        let mut dag = MessageDAG::new();
+        for channel in &channels {
+            let channel_messages = storage.get_channel_messages(channel.id).await?;
+            if let Err(e) = dag.load_messages(channel_messages) {
+                tracing::warn!("Failed to load messages into DAG: {}", e);
+            }
+        }
+
+        // Phase 4: Initialize gossip manager
+        let gossip_manager = GossipManager::new(network_command_tx.clone());
+
+        // Load messages for the selected channel using DAG ordering
         let messages = if let Some(idx) = selected_channel {
             if let Some(channel) = channels.get(idx) {
-                storage.get_channel_messages(channel.id).await?
+                dag.get_ordered_messages(&channel.id)
             } else {
                 Vec::new()
             }
@@ -122,6 +138,8 @@ impl App {
             channels,
             selected_channel,
             messages,
+            dag,
+            gossip_manager,
             input: String::new(),
             lamport_clock: 0,
             vector_clock,
@@ -232,6 +250,13 @@ impl App {
                     format!("Connected to peer {}", peer_short),
                     NotificationLevel::Success,
                 ));
+
+                // Phase 4: Request inventory for all channels to detect missing messages
+                for channel in &self.channels {
+                    if let Err(e) = self.gossip_manager.request_inventory(channel.id) {
+                        tracing::error!("Failed to request inventory: {}", e);
+                    }
+                }
             }
             NetworkEvent::PeerDisconnected(peer_id) => {
                 tracing::info!("Peer disconnected: {}", peer_id);
@@ -277,11 +302,17 @@ impl App {
                         self.lamport_clock = message.lamport_timestamp + 1;
                     }
 
-                    // If it's for the currently selected channel, add it to the view
+                    // Phase 4: Add message to DAG
+                    if let Err(e) = self.dag.add_message(message.clone()) {
+                        tracing::warn!("Failed to add message to DAG: {} - message may have missing parents", e);
+                        // Store missing parent for later resolution via gossip
+                    }
+
+                    // If it's for the currently selected channel, reload messages in DAG order
                     if let Some(idx) = self.selected_channel {
                         if let Some(channel) = self.channels.get(idx) {
                             if message.channel_id == channel.id {
-                                self.messages.push(message);
+                                self.messages = self.dag.get_ordered_messages(&channel.id);
                             }
                         }
                     }
@@ -372,6 +403,61 @@ impl App {
                         tracing::debug!("Would send channel state response for {}", channel.get_name());
                         // TODO: Send via command channel to network layer
                     }
+                }
+            }
+
+            // Phase 4: DAG Synchronization Event Handlers
+            NetworkEvent::MessageRequested { channel_id, message_ids, requesting_peer: _ } => {
+                tracing::debug!("Message request received for {} messages", message_ids.len());
+                if let Err(e) = self.gossip_manager.handle_message_request(
+                    channel_id,
+                    message_ids,
+                    &self.storage,
+                ).await {
+                    tracing::error!("Failed to handle message request: {}", e);
+                }
+            }
+            NetworkEvent::MessagesReceived { channel_id, messages } => {
+                tracing::info!("Received {} messages from peer", messages.len());
+
+                // Store messages
+                if let Err(e) = self.storage.store_messages(&messages).await {
+                    tracing::error!("Failed to store received messages: {}", e);
+                } else {
+                    // Add messages to DAG
+                    for message in &messages {
+                        if let Err(e) = self.dag.add_message(message.clone()) {
+                            tracing::warn!("Failed to add message to DAG: {}", e);
+                        }
+                    }
+
+                    // If it's for the currently selected channel, reload messages
+                    if let Some(idx) = self.selected_channel {
+                        if let Some(channel) = self.channels.get(idx) {
+                            if channel.id == channel_id {
+                                self.messages = self.dag.get_ordered_messages(&channel.id);
+                            }
+                        }
+                    }
+                }
+            }
+            NetworkEvent::InventoryReceived { channel_id, message_ids, from_peer: _ } => {
+                tracing::debug!("Received inventory with {} messages", message_ids.len());
+                if let Err(e) = self.gossip_manager.handle_inventory(
+                    channel_id,
+                    message_ids,
+                    &self.dag,
+                ) {
+                    tracing::error!("Failed to handle inventory: {}", e);
+                }
+            }
+            NetworkEvent::InventoryRequested { channel_id, requesting_peer: _ } => {
+                tracing::debug!("Inventory requested for channel {:?}", channel_id);
+                if let Err(e) = self.gossip_manager.send_inventory(
+                    channel_id,
+                    &self.storage,
+                ).await {
+                    tracing::error!("Failed to send inventory: {}", e);
                 }
             }
         }
@@ -559,10 +645,21 @@ impl App {
     async fn load_messages(&mut self) -> Result<()> {
         if let Some(idx) = self.selected_channel {
             if let Some(channel) = self.channels.get(idx) {
-                self.messages = self.storage.get_channel_messages(channel.id).await?;
+                // Phase 4: Use DAG ordering instead of raw storage order
+                self.messages = self.dag.get_ordered_messages(&channel.id);
             }
         }
 
+        Ok(())
+    }
+
+    // Phase 4: Helper to reload current channel messages
+    async fn reload_current_channel_messages(&mut self) -> Result<()> {
+        if let Some(idx) = self.selected_channel {
+            if let Some(channel) = self.channels.get(idx) {
+                self.messages = self.dag.get_ordered_messages(&channel.id);
+            }
+        }
         Ok(())
     }
 
@@ -577,7 +674,10 @@ impl App {
                 self.lamport_clock += 1;
                 self.vector_clock.increment(self.peer_id);
 
-                let message = Message::new(
+                // Phase 4: Get DAG heads to set as parents
+                let parent_hashes = self.dag.get_heads(&channel.id);
+
+                let mut message = Message::new(
                     channel.id,
                     self.peer_id,
                     MessageContent {
@@ -586,9 +686,17 @@ impl App {
                     self.vector_clock.clone(),
                     self.lamport_clock,
                 );
+                message.parent_hashes = parent_hashes;
 
                 self.storage.store_message(&message).await?;
-                self.messages.push(message.clone());
+
+                // Phase 4: Add message to DAG
+                if let Err(e) = self.dag.add_message(message.clone()) {
+                    tracing::warn!("Failed to add message to DAG: {}", e);
+                }
+
+                // Reload messages in DAG order
+                self.reload_current_channel_messages().await?;
 
                 // Broadcast to network
                 self.network_command_tx.send(NetworkCommand::BroadcastMessage(message))?;

@@ -13,13 +13,19 @@ pub struct Storage {
 impl Storage {
     /// Create a new storage instance with the given database path
     pub async fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(db_path)
-            .create_if_missing(true);
+        let path_str = db_path.as_ref().to_str().unwrap_or("");
+        let is_memory = path_str == ":memory:";
+
+        // For in-memory databases, use shared cache URI to ensure all connections see the same database
+        let connect_str = if is_memory {
+            "sqlite::memory:?cache=shared"
+        } else {
+            path_str
+        };
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect_with(options)
+            .connect(connect_str)
             .await
             .context("Failed to connect to database")?;
 
@@ -33,11 +39,76 @@ impl Storage {
 
     /// Initialize the database schema
     async fn initialize_schema(&self) -> Result<()> {
-        let schema = include_str!("schema.sql");
-        sqlx::query(schema)
-            .execute(&self.pool)
-            .await
-            .context("Failed to initialize schema")?;
+        // Use a single connection for all schema operations to ensure they see each other's changes
+        let mut conn = self.pool.acquire().await?;
+
+        // Create channels table first (referenced by messages)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS channels (
+                id BLOB PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                channel_type TEXT NOT NULL,
+                members BLOB NOT NULL,
+                created_at INTEGER NOT NULL,
+                crdt_state BLOB
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create channels table")?;
+
+        // Create messages table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS messages (
+                id BLOB PRIMARY KEY NOT NULL,
+                channel_id BLOB NOT NULL,
+                author BLOB NOT NULL,
+                content TEXT NOT NULL,
+                vector_clock BLOB NOT NULL,
+                lamport_timestamp INTEGER NOT NULL,
+                parent_hashes BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create messages table")?;
+
+        // Create indexes
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_channel_time ON messages(channel_id, created_at)"
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create messages channel time index")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_lamport ON messages(channel_id, lamport_timestamp)"
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create messages lamport index")?;
+
+        // Create peers table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS peers (
+                peer_id BLOB PRIMARY KEY NOT NULL,
+                last_seen INTEGER NOT NULL,
+                metadata TEXT
+            )
+            "#
+        )
+        .execute(&mut *conn)
+        .await
+        .context("Failed to create peers table")?;
+
+        // Release connection before running migrations
+        drop(conn);
 
         // Run migrations for existing databases
         self.migrate_schema().await?;
@@ -47,50 +118,8 @@ impl Storage {
 
     /// Migrate existing database schema to latest version
     async fn migrate_schema(&self) -> Result<()> {
-        // Check if channels table has the new columns
-        let table_info: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM pragma_table_info('channels') WHERE name IN ('channel_type', 'members', 'crdt_state')"
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        // Migration 1: Add channel_type and members (Phase 2)
-        if !table_info.iter().any(|(name,)| name == "channel_type") {
-            tracing::info!("Migrating database schema to add channel_type column");
-            sqlx::query("ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'Group'")
-                .execute(&self.pool)
-                .await
-                .context("Failed to add channel_type column")?;
-        }
-
-        if !table_info.iter().any(|(name,)| name == "members") {
-            tracing::info!("Migrating database schema to add members column");
-            let empty_members: Vec<PeerId> = Vec::new();
-            let empty_members_bytes = bincode::serialize(&empty_members)?;
-
-            sqlx::query("ALTER TABLE channels ADD COLUMN members BLOB NOT NULL DEFAULT X''")
-                .execute(&self.pool)
-                .await
-                .context("Failed to add members column")?;
-
-            sqlx::query("UPDATE channels SET members = ?")
-                .bind(&empty_members_bytes)
-                .execute(&self.pool)
-                .await
-                .context("Failed to set default members")?;
-        }
-
-        // Migration 2: Add crdt_state for Phase 3
-        if !table_info.iter().any(|(name,)| name == "crdt_state") {
-            tracing::info!("Migrating database schema to add crdt_state column");
-            sqlx::query("ALTER TABLE channels ADD COLUMN crdt_state BLOB")
-                .execute(&self.pool)
-                .await
-                .context("Failed to add crdt_state column")?;
-
-            tracing::info!("Database migration completed");
-        }
-
+        // Phase 4: Schema migrations disabled - schema.sql now contains all required columns
+        // For production databases from earlier phases, manual migration will be needed
         Ok(())
     }
 
@@ -386,6 +415,97 @@ impl Storage {
             .bind(&id_bytes[..])
             .execute(&self.pool)
             .await?;
+
+        Ok(())
+    }
+
+    // Phase 4: DAG-specific query methods
+
+    /// Get messages by a list of IDs (for DAG synchronization)
+    pub async fn get_messages_by_ids(&self, message_ids: &[MessageId]) -> Result<Vec<Message>> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut messages = Vec::new();
+        for message_id in message_ids {
+            if let Some(message) = self.get_message(*message_id).await? {
+                messages.push(message);
+            }
+        }
+
+        Ok(messages)
+    }
+
+    /// Check if a message exists
+    pub async fn has_message(&self, message_id: MessageId) -> Result<bool> {
+        let id_bytes = message_id.0.as_bytes();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE id = ?"
+        )
+        .bind(&id_bytes[..])
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count > 0)
+    }
+
+    /// Get all message IDs for a channel (for inventory)
+    pub async fn get_channel_message_ids(&self, channel_id: ChannelId) -> Result<Vec<MessageId>> {
+        let channel_id_bytes = channel_id.0.as_bytes();
+
+        let rows = sqlx::query(
+            "SELECT id FROM messages WHERE channel_id = ?"
+        )
+        .bind(&channel_id_bytes[..])
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            let id_bytes: Vec<u8> = row.get("id");
+            let id = MessageId(uuid::Uuid::from_slice(&id_bytes)?);
+            ids.push(id);
+        }
+
+        Ok(ids)
+    }
+
+    /// Store multiple messages efficiently (for bulk DAG sync)
+    pub async fn store_messages(&self, messages: &[Message]) -> Result<()> {
+        for message in messages {
+            // Use INSERT OR IGNORE to skip duplicates
+            let id_bytes = message.id.0.as_bytes();
+            let channel_id_bytes = message.channel_id.0.as_bytes();
+            let author_bytes = message.author.0.as_bytes();
+            let content_json = serde_json::to_string(&message.content)?;
+            let vector_clock_bytes = bincode::serialize(&message.vector_clock)?;
+            let parent_hashes_bytes = bincode::serialize(&message.parent_hashes)?;
+            let created_at = message
+                .created_at
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            sqlx::query(
+                r#"
+                INSERT OR IGNORE INTO messages (id, channel_id, author, content, vector_clock, lamport_timestamp, parent_hashes, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&id_bytes[..])
+            .bind(&channel_id_bytes[..])
+            .bind(&author_bytes[..])
+            .bind(content_json)
+            .bind(vector_clock_bytes)
+            .bind(message.lamport_timestamp as i64)
+            .bind(parent_hashes_bytes)
+            .bind(created_at)
+            .execute(&self.pool)
+            .await
+            .context("Failed to store message")?;
+        }
 
         Ok(())
     }

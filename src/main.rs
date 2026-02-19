@@ -1,4 +1,5 @@
 mod crdt;
+mod dag;
 mod identity;
 mod network;
 mod protocol;

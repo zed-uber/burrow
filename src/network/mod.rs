@@ -1,5 +1,5 @@
 use crate::protocol::NetworkMessage;
-use crate::types::{Channel, ChannelId, Message};
+use crate::types::{Channel, ChannelId, Message, MessageId};
 use anyhow::{Context, Result};
 use libp2p::{
     core::upgrade,
@@ -56,6 +56,34 @@ pub enum NetworkEvent {
         channel_id: ChannelId,
         requesting_peer: PeerId,
     },
+
+    // Phase 4: DAG Synchronization Events
+
+    /// Received a request for specific messages
+    MessageRequested {
+        channel_id: ChannelId,
+        message_ids: Vec<MessageId>,
+        requesting_peer: PeerId,
+    },
+
+    /// Received messages in response to a request
+    MessagesReceived {
+        channel_id: ChannelId,
+        messages: Vec<Message>,
+    },
+
+    /// Received message inventory from a peer
+    InventoryReceived {
+        channel_id: ChannelId,
+        message_ids: std::collections::HashSet<MessageId>,
+        from_peer: PeerId,
+    },
+
+    /// Received inventory request from a peer
+    InventoryRequested {
+        channel_id: ChannelId,
+        requesting_peer: PeerId,
+    },
 }
 
 /// Commands sent to the network layer
@@ -78,6 +106,31 @@ pub enum NetworkCommand {
 
     /// Broadcast a channel update (name change, member change, etc)
     BroadcastChannelUpdate(Channel),
+
+    // Phase 4: DAG Synchronization Commands
+
+    /// Request specific messages by ID
+    RequestMessages {
+        channel_id: ChannelId,
+        message_ids: Vec<MessageId>,
+    },
+
+    /// Send messages in response to a request
+    RespondWithMessages {
+        channel_id: ChannelId,
+        messages: Vec<Message>,
+    },
+
+    /// Broadcast message inventory for anti-entropy
+    BroadcastInventory {
+        channel_id: ChannelId,
+        message_ids: std::collections::HashSet<MessageId>,
+    },
+
+    /// Request message inventory from peers
+    RequestInventory {
+        channel_id: ChannelId,
+    },
 }
 
 /// Network behavior combining multiple protocols
@@ -254,6 +307,36 @@ impl Network {
                             debug!("Channel update from {}: {}", peer_id, channel.get_name());
                             self.event_tx.send(NetworkEvent::ChannelUpdated(channel))?;
                         }
+                        NetworkMessage::MessageRequest { channel_id, message_ids } => {
+                            debug!("Message request from {} for {} messages", peer_id, message_ids.len());
+                            self.event_tx.send(NetworkEvent::MessageRequested {
+                                channel_id,
+                                message_ids,
+                                requesting_peer: peer_id,
+                            })?;
+                        }
+                        NetworkMessage::MessageResponse { channel_id, messages } => {
+                            debug!("Message response from {} with {} messages", peer_id, messages.len());
+                            self.event_tx.send(NetworkEvent::MessagesReceived {
+                                channel_id,
+                                messages,
+                            })?;
+                        }
+                        NetworkMessage::MessageInventory { channel_id, message_ids } => {
+                            debug!("Message inventory from {} with {} messages", peer_id, message_ids.len());
+                            self.event_tx.send(NetworkEvent::InventoryReceived {
+                                channel_id,
+                                message_ids,
+                                from_peer: peer_id,
+                            })?;
+                        }
+                        NetworkMessage::InventoryRequest { channel_id } => {
+                            debug!("Inventory request from {} for channel {:?}", peer_id, channel_id);
+                            self.event_tx.send(NetworkEvent::InventoryRequested {
+                                channel_id,
+                                requesting_peer: peer_id,
+                            })?;
+                        }
                         _ => {
                             debug!("Received other network message type");
                         }
@@ -387,6 +470,50 @@ impl Network {
             NetworkCommand::BroadcastChannelUpdate(channel) => {
                 debug!("Broadcasting channel update: {}", channel.get_name());
                 let network_msg = NetworkMessage::ChannelUpdate { channel };
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
+            }
+
+            NetworkCommand::RequestMessages { channel_id, message_ids } => {
+                debug!("Requesting {} messages for channel {:?}", message_ids.len(), channel_id);
+                let network_msg = NetworkMessage::MessageRequest { channel_id, message_ids };
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
+            }
+
+            NetworkCommand::RespondWithMessages { channel_id, messages } => {
+                debug!("Sending {} messages for channel {:?}", messages.len(), channel_id);
+                let network_msg = NetworkMessage::MessageResponse { channel_id, messages };
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
+            }
+
+            NetworkCommand::BroadcastInventory { channel_id, message_ids } => {
+                debug!("Broadcasting inventory with {} messages for channel {:?}", message_ids.len(), channel_id);
+                let network_msg = NetworkMessage::MessageInventory { channel_id, message_ids };
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
+            }
+
+            NetworkCommand::RequestInventory { channel_id } => {
+                debug!("Requesting inventory for channel {:?}", channel_id);
+                let network_msg = NetworkMessage::InventoryRequest { channel_id };
                 let bytes = network_msg.to_bytes()?;
 
                 self.swarm

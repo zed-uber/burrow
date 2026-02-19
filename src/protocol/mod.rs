@@ -1,5 +1,6 @@
-use crate::types::{Channel, ChannelId, Message, PeerId};
+use crate::types::{Channel, ChannelId, Message, MessageId, PeerId};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Network protocol messages exchanged between peers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +44,32 @@ pub enum NetworkMessage {
     /// Incremental CRDT update for a channel (name change, member add/remove)
     ChannelUpdate {
         channel: Channel,
+    },
+
+    // Phase 4: DAG Synchronization Messages
+
+    /// Request specific messages by ID (to fill DAG gaps)
+    MessageRequest {
+        channel_id: ChannelId,
+        message_ids: Vec<MessageId>,
+    },
+
+    /// Response with requested messages
+    MessageResponse {
+        channel_id: ChannelId,
+        messages: Vec<Message>,
+    },
+
+    /// Anti-entropy: announce which messages we have for a channel
+    /// Peers can use this to detect missing messages
+    MessageInventory {
+        channel_id: ChannelId,
+        message_ids: HashSet<MessageId>,
+    },
+
+    /// Request message inventory from peers for anti-entropy
+    InventoryRequest {
+        channel_id: ChannelId,
     },
 }
 
