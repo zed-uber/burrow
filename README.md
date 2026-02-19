@@ -253,7 +253,7 @@ Burrow is in active development. Contributions, bug reports, and feature request
 
 ## License
 
-[License to be determined]
+This project is licensed under the GNU Affero General Public License v3.0 or later - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
