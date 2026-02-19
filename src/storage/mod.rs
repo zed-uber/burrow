@@ -49,41 +49,44 @@ impl Storage {
     async fn migrate_schema(&self) -> Result<()> {
         // Check if channels table has the new columns
         let table_info: Vec<(String,)> = sqlx::query_as(
-            "SELECT name FROM pragma_table_info('channels') WHERE name IN ('channel_type', 'members')"
+            "SELECT name FROM pragma_table_info('channels') WHERE name IN ('channel_type', 'members', 'crdt_state')"
         )
         .fetch_all(&self.pool)
         .await?;
 
-        // If we don't have 2 results, we need to migrate
-        if table_info.len() < 2 {
-            tracing::info!("Migrating database schema to add channel_type and members columns");
+        // Migration 1: Add channel_type and members (Phase 2)
+        if !table_info.iter().any(|(name,)| name == "channel_type") {
+            tracing::info!("Migrating database schema to add channel_type column");
+            sqlx::query("ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'Group'")
+                .execute(&self.pool)
+                .await
+                .context("Failed to add channel_type column")?;
+        }
 
-            // Add channel_type column if missing
-            if !table_info.iter().any(|(name,)| name == "channel_type") {
-                sqlx::query("ALTER TABLE channels ADD COLUMN channel_type TEXT NOT NULL DEFAULT 'Group'")
-                    .execute(&self.pool)
-                    .await
-                    .context("Failed to add channel_type column")?;
-            }
+        if !table_info.iter().any(|(name,)| name == "members") {
+            tracing::info!("Migrating database schema to add members column");
+            let empty_members: Vec<PeerId> = Vec::new();
+            let empty_members_bytes = bincode::serialize(&empty_members)?;
 
-            // Add members column if missing
-            if !table_info.iter().any(|(name,)| name == "members") {
-                // Default to empty members list (empty bincode vec)
-                let empty_members: Vec<PeerId> = Vec::new();
-                let empty_members_bytes = bincode::serialize(&empty_members)?;
+            sqlx::query("ALTER TABLE channels ADD COLUMN members BLOB NOT NULL DEFAULT X''")
+                .execute(&self.pool)
+                .await
+                .context("Failed to add members column")?;
 
-                sqlx::query("ALTER TABLE channels ADD COLUMN members BLOB NOT NULL DEFAULT X''")
-                    .execute(&self.pool)
-                    .await
-                    .context("Failed to add members column")?;
+            sqlx::query("UPDATE channels SET members = ?")
+                .bind(&empty_members_bytes)
+                .execute(&self.pool)
+                .await
+                .context("Failed to set default members")?;
+        }
 
-                // Update all existing channels with empty members list
-                sqlx::query("UPDATE channels SET members = ?")
-                    .bind(&empty_members_bytes)
-                    .execute(&self.pool)
-                    .await
-                    .context("Failed to set default members")?;
-            }
+        // Migration 2: Add crdt_state for Phase 3
+        if !table_info.iter().any(|(name,)| name == "crdt_state") {
+            tracing::info!("Migrating database schema to add crdt_state column");
+            sqlx::query("ALTER TABLE channels ADD COLUMN crdt_state BLOB")
+                .execute(&self.pool)
+                .await
+                .context("Failed to add crdt_state column")?;
 
             tracing::info!("Database migration completed");
         }
@@ -205,14 +208,22 @@ impl Storage {
         })
     }
 
-    /// Store a channel
+    /// Store a channel with CRDT state
     pub async fn store_channel(&self, channel: &Channel) -> Result<()> {
         let id_bytes = channel.id.0.as_bytes();
         let channel_type_str = match channel.channel_type {
             ChannelType::PeerToPeer => "PeerToPeer",
             ChannelType::Group => "Group",
         };
-        let members_bytes = bincode::serialize(&channel.members)?;
+
+        // Cache the name and members for quick display
+        let name = channel.get_name().clone();
+        let members = channel.get_members();
+        let members_bytes = bincode::serialize(&members)?;
+
+        // Serialize the full CRDT state
+        let crdt_state = bincode::serialize(channel)?;
+
         let created_at = channel
             .created_at
             .duration_since(UNIX_EPOCH)
@@ -221,19 +232,21 @@ impl Storage {
 
         sqlx::query(
             r#"
-            INSERT INTO channels (id, name, channel_type, members, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO channels (id, name, channel_type, members, created_at, crdt_state)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 channel_type = excluded.channel_type,
-                members = excluded.members
+                members = excluded.members,
+                crdt_state = excluded.crdt_state
             "#,
         )
         .bind(&id_bytes[..])
-        .bind(&channel.name)
+        .bind(name)
         .bind(channel_type_str)
         .bind(members_bytes)
         .bind(created_at)
+        .bind(crdt_state)
         .execute(&self.pool)
         .await
         .context("Failed to store channel")?;
@@ -247,7 +260,7 @@ impl Storage {
 
         let row = sqlx::query(
             r#"
-            SELECT id, name, channel_type, members, created_at
+            SELECT id, name, channel_type, members, created_at, crdt_state
             FROM channels
             WHERE id = ?
             "#,
@@ -258,6 +271,16 @@ impl Storage {
 
         match row {
             Some(row) => {
+                // Try to deserialize from crdt_state first (Phase 3+)
+                let crdt_state_bytes: Option<Vec<u8>> = row.try_get("crdt_state").ok().flatten();
+
+                if let Some(state_bytes) = crdt_state_bytes {
+                    if let Ok(channel) = bincode::deserialize::<Channel>(&state_bytes) {
+                        return Ok(Some(channel));
+                    }
+                }
+
+                // Fall back to old format (Phase 2) - reconstruct Channel with CRDTs
                 let id_bytes: Vec<u8> = row.get("id");
                 let name: String = row.get("name");
                 let channel_type_str: String = row.get("channel_type");
@@ -268,18 +291,24 @@ impl Storage {
                 let channel_type = match channel_type_str.as_str() {
                     "PeerToPeer" => ChannelType::PeerToPeer,
                     "Group" => ChannelType::Group,
-                    _ => ChannelType::Group, // Default to group for unknown types
+                    _ => ChannelType::Group,
                 };
-                let members: Vec<PeerId> = bincode::deserialize(&members_bytes)?;
+                let old_members: Vec<PeerId> = bincode::deserialize(&members_bytes)?;
                 let created_at = UNIX_EPOCH + std::time::Duration::from_secs(created_at as u64);
 
-                Ok(Some(Channel {
-                    id,
-                    name,
-                    channel_type,
-                    members,
-                    created_at,
-                }))
+                // Create a new channel with CRDT state from old data
+                // Use first member as creator, or generate a placeholder peer
+                let creator = old_members.first().copied().unwrap_or_else(PeerId::new);
+                let mut channel = Channel::placeholder(id, name, creator);
+                channel.channel_type = channel_type;
+                channel.created_at = created_at;
+
+                // Add all members to the ORSet
+                for member in old_members {
+                    channel.add_member(member);
+                }
+
+                Ok(Some(channel))
             }
             None => Ok(None),
         }
@@ -289,7 +318,7 @@ impl Storage {
     pub async fn get_all_channels(&self) -> Result<Vec<Channel>> {
         let rows = sqlx::query(
             r#"
-            SELECT id, name, channel_type, members, created_at
+            SELECT id, name, channel_type, members, created_at, crdt_state
             FROM channels
             ORDER BY created_at DESC
             "#,
@@ -299,6 +328,17 @@ impl Storage {
 
         let mut channels = Vec::new();
         for row in rows {
+            // Try to deserialize from crdt_state first (Phase 3+)
+            let crdt_state_bytes: Option<Vec<u8>> = row.try_get("crdt_state").ok().flatten();
+
+            if let Some(state_bytes) = crdt_state_bytes {
+                if let Ok(channel) = bincode::deserialize::<Channel>(&state_bytes) {
+                    channels.push(channel);
+                    continue;
+                }
+            }
+
+            // Fall back to old format (Phase 2) - reconstruct Channel with CRDTs
             let id_bytes: Vec<u8> = row.get("id");
             let name: String = row.get("name");
             let channel_type_str: String = row.get("channel_type");
@@ -311,16 +351,21 @@ impl Storage {
                 "Group" => ChannelType::Group,
                 _ => ChannelType::Group,
             };
-            let members: Vec<PeerId> = bincode::deserialize(&members_bytes)?;
+            let old_members: Vec<PeerId> = bincode::deserialize(&members_bytes)?;
             let created_at = UNIX_EPOCH + std::time::Duration::from_secs(created_at as u64);
 
-            channels.push(Channel {
-                id,
-                name,
-                channel_type,
-                members,
-                created_at,
-            });
+            // Create a new channel with CRDT state from old data
+            let creator = old_members.first().copied().unwrap_or_else(PeerId::new);
+            let mut channel = Channel::placeholder(id, name, creator);
+            channel.channel_type = channel_type;
+            channel.created_at = created_at;
+
+            // Add all members to the ORSet
+            for member in old_members {
+                channel.add_member(member);
+            }
+
+            channels.push(channel);
         }
 
         Ok(channels)
@@ -361,7 +406,7 @@ mod tests {
 
         let retrieved = storage.get_channel(channel.id).await.unwrap().unwrap();
         assert_eq!(retrieved.id, channel.id);
-        assert_eq!(retrieved.name, channel.name);
+        assert_eq!(retrieved.get_name(), channel.get_name());
 
         let all_channels = storage.get_all_channels().await.unwrap();
         assert_eq!(all_channels.len(), 1);

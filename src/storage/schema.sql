@@ -22,11 +22,11 @@ CREATE INDEX IF NOT EXISTS idx_messages_lamport
 -- Channels table
 CREATE TABLE IF NOT EXISTS channels (
     id BLOB PRIMARY KEY NOT NULL,
-    name TEXT NOT NULL,
+    name TEXT NOT NULL,                         -- Cached name for display (extracted from CRDT)
     channel_type TEXT NOT NULL,                 -- "PeerToPeer" or "Group"
-    members BLOB NOT NULL,                      -- Bincode serialized Vec<PeerId>
-    created_at INTEGER NOT NULL                 -- Unix timestamp in seconds
-    -- CRDT state will be added in Phase 3
+    members BLOB NOT NULL,                      -- Cached members for display (extracted from CRDT)
+    created_at INTEGER NOT NULL,                -- Unix timestamp in seconds
+    crdt_state BLOB                             -- Bincode serialized full Channel CRDT state
     -- Encryption keys will be added in Phase 5
 );
 

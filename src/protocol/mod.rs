@@ -1,4 +1,4 @@
-use crate::types::{ChannelId, Message, PeerId};
+use crate::types::{Channel, ChannelId, Message, PeerId};
 use serde::{Deserialize, Serialize};
 
 /// Network protocol messages exchanged between peers
@@ -23,6 +23,26 @@ pub enum NetworkMessage {
     PeerAnnounce {
         peer_id: PeerId,
         listen_addresses: Vec<String>,
+    },
+
+    /// Channel announcement - broadcast when creating a new channel
+    ChannelAnnounce {
+        channel: Channel,
+    },
+
+    /// Request full CRDT state for a channel
+    ChannelStateRequest {
+        channel_id: ChannelId,
+    },
+
+    /// Response with full CRDT state for a channel
+    ChannelStateResponse {
+        channel: Channel,
+    },
+
+    /// Incremental CRDT update for a channel (name change, member add/remove)
+    ChannelUpdate {
+        channel: Channel,
     },
 }
 

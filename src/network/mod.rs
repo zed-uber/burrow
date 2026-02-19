@@ -1,5 +1,5 @@
 use crate::protocol::NetworkMessage;
-use crate::types::Message;
+use crate::types::{Channel, ChannelId, Message};
 use anyhow::{Context, Result};
 use libp2p::{
     core::upgrade,
@@ -41,6 +41,21 @@ pub enum NetworkEvent {
     ConnectionDialing {
         address: String,
     },
+
+    /// A peer announced a new channel
+    ChannelAnnounced(Channel),
+
+    /// Received full channel state in response to a request
+    ChannelStateReceived(Channel),
+
+    /// A peer sent an incremental channel update
+    ChannelUpdated(Channel),
+
+    /// Received a request for channel state (we should respond)
+    ChannelStateRequested {
+        channel_id: ChannelId,
+        requesting_peer: PeerId,
+    },
 }
 
 /// Commands sent to the network layer
@@ -54,6 +69,15 @@ pub enum NetworkCommand {
 
     /// Get list of connected peers
     ListPeers,
+
+    /// Broadcast a new channel announcement
+    AnnounceChannel(Channel),
+
+    /// Request full channel state from peers
+    RequestChannelState(ChannelId),
+
+    /// Broadcast a channel update (name change, member change, etc)
+    BroadcastChannelUpdate(Channel),
 }
 
 /// Network behavior combining multiple protocols
@@ -211,6 +235,25 @@ impl Network {
                             debug!("Chat message: {:?}", msg);
                             self.event_tx.send(NetworkEvent::MessageReceived(msg))?;
                         }
+                        NetworkMessage::ChannelAnnounce { channel } => {
+                            debug!("Channel announcement from {}: {}", peer_id, channel.get_name());
+                            self.event_tx.send(NetworkEvent::ChannelAnnounced(channel))?;
+                        }
+                        NetworkMessage::ChannelStateRequest { channel_id } => {
+                            debug!("Channel state request from {} for {:?}", peer_id, channel_id);
+                            self.event_tx.send(NetworkEvent::ChannelStateRequested {
+                                channel_id,
+                                requesting_peer: peer_id,
+                            })?;
+                        }
+                        NetworkMessage::ChannelStateResponse { channel } => {
+                            debug!("Channel state response from {}: {}", peer_id, channel.get_name());
+                            self.event_tx.send(NetworkEvent::ChannelStateReceived(channel))?;
+                        }
+                        NetworkMessage::ChannelUpdate { channel } => {
+                            debug!("Channel update from {}: {}", peer_id, channel.get_name());
+                            self.event_tx.send(NetworkEvent::ChannelUpdated(channel))?;
+                        }
                         _ => {
                             debug!("Received other network message type");
                         }
@@ -317,6 +360,39 @@ impl Network {
             NetworkCommand::ListPeers => {
                 let peers: Vec<_> = self.swarm.connected_peers().collect();
                 info!("Connected peers: {:?}", peers);
+            }
+
+            NetworkCommand::AnnounceChannel(channel) => {
+                debug!("Broadcasting channel announcement: {}", channel.get_name());
+                let network_msg = NetworkMessage::ChannelAnnounce { channel };
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
+            }
+
+            NetworkCommand::RequestChannelState(channel_id) => {
+                debug!("Requesting channel state for {:?}", channel_id);
+                let network_msg = NetworkMessage::ChannelStateRequest { channel_id };
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
+            }
+
+            NetworkCommand::BroadcastChannelUpdate(channel) => {
+                debug!("Broadcasting channel update: {}", channel.get_name());
+                let network_msg = NetworkMessage::ChannelUpdate { channel };
+                let bytes = network_msg.to_bytes()?;
+
+                self.swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(self.gossip_topic.clone(), bytes)?;
             }
         }
 

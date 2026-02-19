@@ -1,189 +1,189 @@
 # Burrow
 
-A decentralized, encrypted peer-to-peer chat application with a terminal user interface (TUI).
+**A decentralized peer-to-peer chat application for the terminal.**
 
-## Current Status: Phase 2 Complete ✓
+Burrow is a privacy-focused, serverless messaging platform that runs entirely in your terminal. Built on libp2p, it enables direct peer-to-peer communication without relying on central servers. Messages and channels synchronize automatically using conflict-free replicated data types (CRDTs), ensuring eventual consistency across all peers.
 
-**Phase 1: Foundation & Storage** ✅
-- ✅ Core type definitions (PeerId, MessageId, ChannelId, Message, Channel)
-- ✅ Vector Clock implementation for causal ordering
-- ✅ SQLite storage layer with CRUD operations
-- ✅ Basic TUI with channel management and messaging
-- ✅ Local message persistence
+## Features
 
-**Phase 2: P2P Networking** ✅
-- ✅ libp2p integration with TCP, Noise encryption, and Yamux multiplexing
-- ✅ Gossipsub for message broadcasting between peers
-- ✅ mDNS for automatic local peer discovery
-- ✅ Manual peer connection via multiaddr (Ctrl+P)
-- ✅ Message broadcast and reception
-- ✅ Peer lifecycle management (connect/disconnect events)
-- ✅ Network events integrated into TUI
+- **Decentralized Architecture**: No servers, no accounts - just peer-to-peer communication
+- **Automatic Peer Discovery**: Find peers on your local network automatically via mDNS
+- **Persistent Identity**: Ed25519 cryptographic keypair gives you a stable identity across sessions
+- **Channel Synchronization**: Create channels that automatically sync with connected peers
+- **Conflict-Free Updates**: CRDT-based state ensures channels converge without conflicts
+- **Terminal Interface**: Clean, keyboard-driven TUI built with ratatui
+- **Local Storage**: All messages and channels stored locally in SQLite
+- **Message Ordering**: Vector clocks and Lamport timestamps maintain causal ordering
 
-## Quick Start
+## Installation
 
-### Build and Run
+### Prerequisites
+
+- Rust toolchain (install from [rustup.rs](https://rustup.rs))
+
+### Build from Source
 
 ```bash
+git clone https://github.com/yourusername/burrow.git
+cd burrow
 cargo build --release
+```
+
+The binary will be available at `target/release/burrow`.
+
+### Run
+
+```bash
 cargo run --release
 ```
 
-### Using the Application
+Or install to your system:
 
-**First Run:**
-- The app automatically creates a "me" channel (your personal space)
-- This channel is selected by default
+```bash
+cargo install --path .
+burrow
+```
 
-**Help Menu:**
-- Press `Ctrl+H` to show the help menu with all keyboard shortcuts
+## Usage
 
-**Creating Channels:**
-1. Press `Ctrl+N` to open the "New Channel" dialog
-2. Type the channel name
-3. Press `Enter` to create (or `Esc` to cancel)
-4. The new channel is automatically selected
+### Getting Started
 
-**Selecting Channels:**
-- Use `↑` and `↓` arrow keys to navigate between channels
+On first launch, Burrow will:
+1. Generate your cryptographic identity (Ed25519 keypair)
+2. Create a default "me" channel for personal notes
+3. Start listening for peer connections on port 9000
+4. Begin discovering peers on your local network
 
-**Sending Messages:**
-1. Select a channel (or use the default "me" channel)
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+H` | Show help menu |
+| `Ctrl+N` | Create new channel |
+| `Ctrl+P` | Connect to peer manually |
+| `↑` / `↓` | Navigate between channels |
+| `Enter` | Send message / Confirm dialog |
+| `Esc` | Cancel dialog |
+| `Ctrl+Q` / `Ctrl+C` | Quit application |
+
+### Creating Channels
+
+1. Press `Ctrl+N` to open the new channel dialog
+2. Type your channel name
+3. Press `Enter` to create
+
+The channel will be automatically announced to all connected peers.
+
+### Connecting to Peers
+
+**Automatic (mDNS):**
+Burrow automatically discovers and connects to peers on your local network.
+
+**Manual Connection:**
+1. Press `Ctrl+P` to open the connect dialog
+2. Enter the peer's multiaddress (e.g., `/ip4/192.168.1.100/tcp/9000`)
+3. Press `Enter` to connect
+
+You can find your own listen addresses in the status bar at the top of the screen.
+
+### Sending Messages
+
+1. Use `↑` / `↓` to select a channel
 2. Type your message in the input box at the bottom
 3. Press `Enter` to send
 
-**Quitting:**
-- Press `Ctrl+Q` or `Ctrl+C` to quit
+Messages are broadcast to all connected peers and stored locally.
 
-**All Keyboard Shortcuts:**
-- `Ctrl+H` - Show help menu
-- `Ctrl+N` - Open new channel dialog
-- `Ctrl+P` - Connect to peer (opens dialog with multiaddr input)
-- `↑/↓` - Navigate channels
-- `Enter` - Send message (or confirm in dialogs)
-- `Esc` - Cancel dialog
-- `Backspace` - Delete character
-- `Ctrl+Q` or `Ctrl+C` - Quit
+## Configuration
 
-### Data Storage
+### Data Storage Locations
 
-**Messages** are stored in a SQLite database at:
-- **Linux**: `~/.local/share/burrow/burrow.db`
-- **macOS**: `~/Library/Application Support/burrow/burrow.db`
-- **Windows**: `%LOCALAPPDATA%\burrow\burrow.db`
+Burrow stores all data locally on your machine:
 
-**Identity** (cryptographic keypair) is stored at:
-- **Linux**: `~/.local/share/burrow/identity.key`
-- **macOS**: `~/Library/Application Support/burrow/identity.key`
-- **Windows**: `%LOCALAPPDATA%\burrow\identity.key`
+| Platform | Location |
+|----------|----------|
+| **Linux** | `~/.local/share/burrow/` |
+| **macOS** | `~/Library/Application Support/burrow/` |
+| **Windows** | `%LOCALAPPDATA%\burrow\` |
 
-Your identity file contains your Ed25519 keypair and is created on first run. This gives you a persistent peer ID across restarts. **Keep this file secure** - it's your cryptographic identity on the network.
+Files in this directory:
+- `identity.key` - Your Ed25519 keypair (keep this secure!)
+- `burrow.db` - SQLite database containing messages and channels
+- `burrow.log` - Application logs
 
-### Logs
+### Port Configuration
 
-Application logs are written to a file (to avoid interfering with the TUI):
-- **Linux**: `~/.local/share/burrow/burrow.log`
-- **macOS**: `~/Library/Application Support/burrow/burrow.log`
-- **Windows**: `%LOCALAPPDATA%\burrow\burrow.log`
+By default, Burrow listens on port 9000. To use a different port:
 
-You can tail the log file in another terminal to see what's happening:
 ```bash
+BURROW_PORT=9001 burrow
+```
+
+### Logging
+
+To enable debug logging:
+
+```bash
+RUST_LOG=burrow=debug burrow
+```
+
+View logs in real-time:
+
+```bash
+# Linux/macOS
 tail -f ~/.local/share/burrow/burrow.log
+
+# Windows
+Get-Content "$env:LOCALAPPDATA\burrow\burrow.log" -Wait
 ```
 
-### What's Working (Phases 1-2)
+## How It Works
 
-**Local Features:**
-- ✅ Auto-created "me" channel on first run
-- ✅ Modal dialog for creating new channels (Ctrl+N)
-- ✅ Keyboard-driven channel navigation (↑/↓)
-- ✅ Send messages to any channel
-- ✅ Messages persist across restarts
-- ✅ Vector clock increments with each message
-- ✅ Messages ordered chronologically
-- ✅ Help menu (Ctrl+H) with all shortcuts
-- ✅ Clean, responsive TUI interface
-
-**Networking Features:**
-- ✅ P2P networking with libp2p (TCP + Noise + Yamux)
-- ✅ Persistent cryptographic identity (Ed25519 keypair)
-- ✅ Automatic peer discovery via mDNS on local network
-- ✅ Manual peer connection via multiaddr (Ctrl+P)
-- ✅ Real-time message broadcasting to connected peers
-- ✅ Receive and store messages from other peers
-- ✅ Status bar showing peer ID, listen addresses, and connected peers
-- ✅ Gossipsub for efficient message distribution
-- ✅ Logs written to file (not stdout) to avoid TUI interference
-
-## Architecture
-
-### Core Components
+### Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    TUI Layer (ratatui)                     │
-│  - Channel list  - Message view  - Voice status  - Input  │
-└─────────────────────────┬──────────────────────────────────┘
-                          ↓
-┌────────────────────────────────────────────────────────────┐
-│                   Storage Layer (SQLite)                   │
-│  - Messages  - Channels  - Keys  - Peers                  │
-└────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│           Terminal UI (ratatui)                 │
+│  Channels │ Messages │ Input │ Status           │
+├─────────────────────────────────────────────────┤
+│              Storage (SQLite)                   │
+│  Messages, Channels, CRDT State                 │
+├─────────────────────────────────────────────────┤
+│            Network (libp2p)                     │
+│  TCP + Noise + Yamux + Gossipsub + mDNS         │
+└─────────────────────────────────────────────────┘
 ```
 
-### Core Types
+### CRDT-Based Synchronization
 
-- **PeerId**: Unique identifier for each peer (UUID v7)
-- **ChannelId**: Unique identifier for channels
-- **MessageId**: Time-ordered message identifier (UUID v7)
-- **VectorClock**: Causal ordering metadata for messages
-- **Message**: Message with content, author, timestamps, and ordering metadata
-- **Channel**: Channel with name and metadata
+Burrow uses Conflict-free Replicated Data Types (CRDTs) to ensure all peers converge to the same state:
+
+- **LWW-Register**: Channel names automatically resolve to the most recent update
+- **OR-Set**: Channel membership merges additions and removals without conflicts
+- **Hybrid Logical Clocks**: Track causality while maintaining physical time awareness
+
+When peers reconnect, channel states automatically merge and converge without manual conflict resolution.
 
 ### Message Ordering
 
-Messages use a hybrid ordering system:
-1. **Vector Clocks**: Track causal relationships between messages
-2. **Lamport Timestamps**: Provide total ordering fallback
-3. **UUID v7**: Time-ordered identifiers for display
+Messages maintain causal ordering using:
+- **Vector Clocks**: Capture happens-before relationships between messages
+- **Lamport Timestamps**: Provide total ordering when concurrent
+- **UUID v7**: Time-based identifiers for consistent display order
 
-## What's Next: Phase 2-7
+## Roadmap
 
-### Phase 2: P2P Networking (Week 2-3)
-- libp2p integration for peer-to-peer connections
-- Manual peer connection via IP:port
-- Message broadcast between peers
-- Peer lifecycle management
+### Current Status: Phase 3 Complete ✓
 
-### Phase 3: CRDT & State Sync (Week 3-4)
-- OR-Set CRDT for channel membership
-- LWW-Register for metadata
-- Hybrid Logical Clocks
-- Conflict resolution
+- [x] **Phase 1**: Foundation - Storage, types, basic TUI
+- [x] **Phase 2**: Networking - P2P connections, message broadcast
+- [x] **Phase 3**: CRDTs - Channel synchronization, conflict-free state
+- [ ] **Phase 4**: Message DAG - Causal message ordering and gossip protocol
+- [ ] **Phase 5**: Encryption - End-to-end encryption with Signal Protocol
+- [ ] **Phase 6**: Voice - Encrypted voice chat with relay support
+- [ ] **Phase 7**: Polish - Testing, optimization, documentation
 
-### Phase 4: Message Ordering & Gossip (Week 4-5)
-- Message DAG for handling concurrent messages
-- Gossip protocol (rumor mongering + anti-entropy)
-- Message deduplication
-- Gap detection and recovery
-
-### Phase 5: Encryption (Week 5-6)
-- Signal Protocol Double Ratchet for 1-to-1 messaging
-- Sender Keys for group messaging
-- Epoch-based key rotation
-- Trust verification
-
-### Phase 6: Voice Chat (Week 6-8)
-- Audio capture/playback with Opus codec
-- SFU relay for voice forwarding
-- SRTP encryption
-- Relay selection and failover
-
-### Phase 7: Polish & Production (Week 8-10)
-- Comprehensive error handling
-- Performance optimization
-- Testing (unit, integration, chaos)
-- Documentation
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design documentation.
 
 ## Development
 
@@ -193,81 +193,71 @@ Messages use a hybrid ordering system:
 cargo test
 ```
 
-### Running with Debug Logging
-
-To enable debug logging, set the `RUST_LOG` environment variable:
-
-```bash
-RUST_LOG=burrow=debug cargo run
-```
-
-Then in another terminal, tail the log file to see debug output:
-
-```bash
-tail -f ~/.local/share/burrow/burrow.log
-```
-
 ### Project Structure
 
 ```
 src/
-├── main.rs           # Application entry point
-├── types/
-│   └── mod.rs       # Core type definitions
-├── storage/
-│   ├── mod.rs       # Storage implementation
-│   └── schema.sql   # Database schema
-├── identity/
-│   └── mod.rs       # Persistent cryptographic identity (Phase 2)
-├── network/         # P2P networking (Phase 2)
-│   ├── mod.rs       # Network implementation
-│   └── peer.rs      # Peer management
-├── protocol/
-│   └── mod.rs       # Network protocol messages (Phase 2)
-└── tui/
-    └── mod.rs       # Terminal UI
-
-Future modules (Phases 3-7):
-├── crdt/           # CRDT implementations (Phase 3)
-├── gossip/         # Gossip protocol (Phase 4)
-├── crypto/         # Encryption (Phase 5)
-└── voice/          # Voice chat (Phase 6)
+├── main.rs         # Application entry point
+├── types/          # Core type definitions
+├── storage/        # SQLite persistence layer
+├── identity/       # Cryptographic identity management
+├── network/        # libp2p networking
+├── protocol/       # Network message protocol
+├── crdt/           # CRDT implementations
+└── tui/            # Terminal user interface
 ```
 
-## Dependencies
+### Key Dependencies
 
-### Core
-- **tokio**: Async runtime
-- **sqlx**: Async SQLite database
-- **serde**: Serialization
-- **uuid**: Time-ordered identifiers
-- **anyhow**: Error handling
-- **tracing**: Structured logging
+- **tokio** - Async runtime
+- **libp2p** - P2P networking stack
+- **sqlx** - Async SQLite database
+- **ratatui** - Terminal UI framework
+- **serde** / **bincode** - Serialization
+- **uuid** - Time-ordered identifiers
 
-### TUI
-- **ratatui**: Terminal UI framework
-- **crossterm**: Terminal manipulation
+## Design Philosophy
 
-### Future (Phases 2-7)
-- **libp2p**: P2P networking
-- **x25519-dalek**: Key agreement
-- **ed25519-dalek**: Digital signatures
-- **chacha20poly1305**: Encryption
-- **cpal**: Audio I/O
-- **opus**: Audio codec
+**Decentralized** - No servers, no accounts. Pure peer-to-peer architecture.
 
-## Design Principles
+**Eventually Consistent** - CRDTs ensure all peers converge to the same state without coordination.
 
-1. **Decentralized**: No central servers, pure P2P
-2. **Encrypted**: End-to-end encryption for all communication
-3. **Eventually Consistent**: CRDT-based state with automatic conflict resolution
-4. **Resilient**: Works offline, syncs when peers reconnect
-5. **Privacy-First**: Local storage, minimal metadata leakage
+**Privacy-First** - All data stored locally. No telemetry, no tracking, no cloud.
 
-## License
+**Offline-Capable** - Works without internet. Syncs automatically when peers reconnect.
 
-TBD
+**Terminal-Native** - Lightweight, keyboard-driven interface for power users.
+
+## Security Considerations
+
+**Current Status:**
+- Network transport encrypted with Noise protocol (libp2p default)
+- Persistent Ed25519 identity for peer authentication
+- Message content currently transmitted in plaintext
+
+**Future (Phase 5):**
+- End-to-end encryption with Signal Protocol
+- Perfect forward secrecy via Double Ratchet
+- Group messaging with Sender Keys
 
 ## Contributing
 
-This project is currently in early development (Phase 1 complete). Contributions welcome once the architecture stabilizes in Phase 3-4.
+Burrow is in active development. Contributions, bug reports, and feature requests are welcome!
+
+### Getting Involved
+
+1. Check existing [issues](https://github.com/yourusername/burrow/issues)
+2. Fork the repository
+3. Create a feature branch
+4. Submit a pull request
+
+## License
+
+[License to be determined]
+
+## Acknowledgments
+
+Built with:
+- [libp2p](https://libp2p.io/) - Modular peer-to-peer networking stack
+- [ratatui](https://ratatui.rs/) - Terminal UI framework
+- [SQLx](https://github.com/launchbadge/sqlx) - Async SQL toolkit

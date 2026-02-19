@@ -1,5 +1,6 @@
 use crate::network::{NetworkCommand, NetworkEvent};
 use crate::network::peer::PeerManager;
+use crate::protocol::NetworkMessage;
 use crate::storage::Storage;
 use crate::types::{Channel, Message, MessageContent, PeerId, VectorClock};
 use anyhow::Result;
@@ -247,7 +248,7 @@ impl App {
                     // In Phase 3, we'll properly sync channel metadata via CRDTs
                     let channel_id_short = message.channel_id.0.to_string();
                     let channel_name = format!("channel-{}", &channel_id_short[..8]);
-                    let channel = Channel::placeholder(message.channel_id, channel_name.clone());
+                    let channel = Channel::placeholder(message.channel_id, channel_name.clone(), message.author);
 
                     if let Err(e) = self.storage.store_channel(&channel).await {
                         tracing::error!("Failed to create placeholder channel: {}", e);
@@ -303,6 +304,75 @@ impl App {
                     format!("Connection failed to {}: {}", address, error),
                     NotificationLevel::Error,
                 ));
+            }
+            NetworkEvent::ChannelAnnounced(channel) => {
+                tracing::info!("Channel announced: {}", channel.get_name());
+
+                // Check if we already have this channel
+                if let Some(existing) = self.channels.iter_mut().find(|c| c.id == channel.id) {
+                    // Merge the CRDT state
+                    existing.merge(&channel);
+                    if let Err(e) = self.storage.store_channel(existing).await {
+                        tracing::error!("Failed to update channel: {}", e);
+                    }
+                } else {
+                    // New channel, add it
+                    if let Err(e) = self.storage.store_channel(&channel).await {
+                        tracing::error!("Failed to store new channel: {}", e);
+                    } else {
+                        self.channels = self.storage.get_all_channels().await?;
+                        self.notification = Some(Notification::new(
+                            format!("New channel: {}", channel.get_name()),
+                            NotificationLevel::Info,
+                        ));
+                    }
+                }
+            }
+            NetworkEvent::ChannelStateReceived(channel) => {
+                tracing::info!("Channel state received: {}", channel.get_name());
+
+                // Merge with existing channel or add as new
+                if let Some(existing) = self.channels.iter_mut().find(|c| c.id == channel.id) {
+                    existing.merge(&channel);
+                    if let Err(e) = self.storage.store_channel(existing).await {
+                        tracing::error!("Failed to update channel: {}", e);
+                    }
+                } else {
+                    if let Err(e) = self.storage.store_channel(&channel).await {
+                        tracing::error!("Failed to store channel: {}", e);
+                    } else {
+                        self.channels = self.storage.get_all_channels().await?;
+                    }
+                }
+            }
+            NetworkEvent::ChannelUpdated(channel) => {
+                tracing::info!("Channel updated: {}", channel.get_name());
+
+                // Merge the update
+                if let Some(existing) = self.channels.iter_mut().find(|c| c.id == channel.id) {
+                    existing.merge(&channel);
+                    if let Err(e) = self.storage.store_channel(existing).await {
+                        tracing::error!("Failed to update channel: {}", e);
+                    }
+                    // Refresh the channel list from storage
+                    self.channels = self.storage.get_all_channels().await?;
+                }
+            }
+            NetworkEvent::ChannelStateRequested { channel_id, requesting_peer: _ } => {
+                tracing::info!("Channel state requested for {:?}", channel_id);
+
+                // Find the channel and send it back
+                if let Some(channel) = self.channels.iter().find(|c| c.id == channel_id) {
+                    let network_msg = NetworkMessage::ChannelStateResponse {
+                        channel: channel.clone()
+                    };
+                    if let Ok(bytes) = network_msg.to_bytes() {
+                        // Send via gossipsub (we'll need to import NetworkMessage)
+                        // For now, just log it - the proper implementation would send via the network
+                        tracing::debug!("Would send channel state response for {}", channel.get_name());
+                        // TODO: Send via command channel to network layer
+                    }
+                }
             }
         }
 
@@ -422,6 +492,13 @@ impl App {
         let channel_id = channel.id;
         self.storage.store_channel(&channel).await?;
         self.channels = self.storage.get_all_channels().await?;
+
+        // Announce the new channel to the network
+        if let Err(e) = self.network_command_tx.send(NetworkCommand::AnnounceChannel(channel.clone())) {
+            tracing::error!("Failed to announce channel: {}", e);
+        } else {
+            tracing::info!("Announced new channel: {}", channel.get_name());
+        }
 
         // Find and select the newly created channel
         if let Some(index) = self.channels.iter().position(|c| c.id == channel_id) {
@@ -585,14 +662,15 @@ impl App {
                 };
 
                 // Show member count for groups
-                let member_info = if channel.channel_type == ChannelType::Group && !channel.members.is_empty() {
-                    format!(" ({})", channel.members.len())
+                let members = channel.get_members();
+                let member_info = if channel.channel_type == ChannelType::Group && !members.is_empty() {
+                    format!(" ({})", members.len())
                 } else {
                     String::new()
                 };
 
                 let content = Line::from(vec![Span::styled(
-                    format!("{} {}{}", icon, channel.name, member_info),
+                    format!("{} {}{}", icon, channel.get_name(), member_info),
                     Style::default().fg(Color::White),
                 )]);
                 ListItem::new(content)
@@ -634,12 +712,13 @@ impl App {
                     ChannelType::PeerToPeer => "@",
                     ChannelType::Group => "#",
                 };
-                let member_info = if c.channel_type == ChannelType::Group && !c.members.is_empty() {
-                    format!(" ({} members)", c.members.len())
+                let members = c.get_members();
+                let member_info = if c.channel_type == ChannelType::Group && !members.is_empty() {
+                    format!(" ({} members)", members.len())
                 } else {
                     String::new()
                 };
-                format!("{} {}{}", icon, c.name, member_info)
+                format!("{} {}{}", icon, c.get_name(), member_info)
             })
             .unwrap_or_else(|| "No channel selected".to_string());
 

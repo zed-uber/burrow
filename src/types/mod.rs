@@ -1,3 +1,4 @@
+use crate::crdt::{HybridLogicalClock, LWWRegister, ORSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -188,27 +189,34 @@ pub enum ChannelType {
     Group,
 }
 
-/// Channel metadata
+/// Channel metadata with CRDT state for conflict-free replication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Channel {
     pub id: ChannelId,
-    pub name: String,
+    pub name: LWWRegister<String>,       // Last-Write-Wins for channel name
     pub channel_type: ChannelType,
-    pub members: Vec<PeerId>,  // List of peer IDs in this channel
+    pub members: ORSet<PeerId>,          // Observed-Remove Set for membership
     pub created_at: SystemTime,
-    // CRDT state will be added in Phase 3 for conflict-free replication
+    pub hlc: HybridLogicalClock,         // For generating timestamps
     // Encryption keys will be added in Phase 5
 }
 
 impl Channel {
     /// Create a new group channel with the creator as the first member
     pub fn new(name: String, creator: PeerId) -> Self {
+        let mut hlc = HybridLogicalClock::new(creator);
+        let timestamp = hlc.tick();
+
+        let mut members = ORSet::new();
+        members.add(creator);
+
         Self {
             id: ChannelId::new(),
-            name,
+            name: LWWRegister::new(name, timestamp),
             channel_type: ChannelType::Group,
-            members: vec![creator],
+            members,
             created_at: SystemTime::now(),
+            hlc,
         }
     }
 
@@ -216,24 +224,71 @@ impl Channel {
     pub fn new_peer_to_peer(peer1: PeerId, peer2: PeerId) -> Self {
         // Name is the other peer's ID (will show nicely formatted in UI)
         let name = format!("@{}", peer2.0.simple());
+        let mut hlc = HybridLogicalClock::new(peer1);
+        let timestamp = hlc.tick();
+
+        let mut members = ORSet::new();
+        members.add(peer1);
+        members.add(peer2);
+
         Self {
             id: ChannelId::new(),
-            name,
+            name: LWWRegister::new(name, timestamp),
             channel_type: ChannelType::PeerToPeer,
-            members: vec![peer1, peer2],
+            members,
             created_at: SystemTime::now(),
+            hlc,
         }
     }
 
     /// Create a placeholder channel (for received messages from unknown channels)
-    pub fn placeholder(id: ChannelId, name: String) -> Self {
+    pub fn placeholder(id: ChannelId, name: String, creator: PeerId) -> Self {
+        let mut hlc = HybridLogicalClock::new(creator);
+        let timestamp = hlc.tick();
+
         Self {
             id,
-            name,
+            name: LWWRegister::new(name, timestamp),
             channel_type: ChannelType::Group,
-            members: Vec::new(),  // Unknown members
+            members: ORSet::new(),  // Unknown members initially
             created_at: SystemTime::now(),
+            hlc,
         }
+    }
+
+    /// Get the current channel name
+    pub fn get_name(&self) -> &String {
+        self.name.value()
+    }
+
+    /// Update the channel name
+    pub fn set_name(&mut self, new_name: String) {
+        let timestamp = self.hlc.tick();
+        self.name.set(new_name, timestamp);
+    }
+
+    /// Add a member to the channel
+    pub fn add_member(&mut self, peer_id: PeerId) -> Uuid {
+        self.members.add(peer_id)
+    }
+
+    /// Remove a member from the channel
+    pub fn remove_member(&mut self, peer_id: &PeerId) {
+        self.members.remove(peer_id);
+    }
+
+    /// Get all members as a Vec
+    pub fn get_members(&self) -> Vec<PeerId> {
+        self.members.elements()
+    }
+
+    /// Merge another channel's state (for CRDT synchronization)
+    pub fn merge(&mut self, other: &Channel) {
+        self.name.merge(&other.name);
+        self.members.merge(&other.members);
+        // Update HLC with the remote timestamp
+        let remote_ts = other.hlc.latest();
+        self.hlc.update(remote_ts);
     }
 }
 
