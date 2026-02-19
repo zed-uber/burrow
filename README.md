@@ -173,13 +173,13 @@ Messages maintain causal ordering using:
 
 ## Roadmap
 
-### Current Status: Phase 3 Complete ✓
+### Current Status: Phase 5 (Storage) Complete ✓
 
 - [x] **Phase 1**: Foundation - Storage, types, basic TUI
 - [x] **Phase 2**: Networking - P2P connections, message broadcast
 - [x] **Phase 3**: CRDTs - Channel synchronization, conflict-free state
-- [ ] **Phase 4**: Message DAG - Causal message ordering and gossip protocol
-- [ ] **Phase 5**: Encryption - End-to-end encryption with Signal Protocol
+- [x] **Phase 4**: Message DAG - Causal message ordering and gossip protocol
+- [~] **Phase 5**: Encryption - Signal Protocol storage layer complete, message encryption pending
 - [ ] **Phase 6**: Voice - Encrypted voice chat with relay support
 - [ ] **Phase 7**: Polish - Testing, optimization, documentation
 
@@ -204,6 +204,8 @@ src/
 ├── network/        # libp2p networking
 ├── protocol/       # Network message protocol
 ├── crdt/           # CRDT implementations
+├── dag/            # Message DAG and gossip protocol
+├── encryption/     # Signal Protocol storage and session management
 └── tui/            # Terminal user interface
 ```
 
@@ -213,6 +215,7 @@ src/
 - **libp2p** - P2P networking stack
 - **sqlx** - Async SQLite database
 - **ratatui** - Terminal UI framework
+- **libsignal-protocol** - Signal Protocol implementation for E2E encryption
 - **serde** / **bincode** - Serialization
 - **uuid** - Time-ordered identifiers
 
@@ -233,10 +236,12 @@ src/
 **Current Status:**
 - Network transport encrypted with Noise protocol (libp2p default)
 - Persistent Ed25519 identity for peer authentication
+- Signal Protocol storage layer implemented (identity keys, prekeys, sessions, sender keys)
 - Message content currently transmitted in plaintext
 
-**Future (Phase 5):**
+**In Progress (Phase 5):**
 - End-to-end encryption with Signal Protocol
+- X3DH key exchange for initial peer connections
 - Perfect forward secrecy via Double Ratchet
 - Group messaging with Sender Keys
 

@@ -15,6 +15,7 @@
 
 mod crdt;
 mod dag;
+mod encryption;
 mod identity;
 mod network;
 mod protocol;
